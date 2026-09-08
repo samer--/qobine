@@ -29,12 +29,7 @@ use crate::ui::{
 };
 use crate::{UiEvent, UiEventSender};
 
-const SIDEBAR_QUEUE: u32 = 0;
-const SIDEBAR_DISCOVER: u32 = 1;
-const SIDEBAR_ALBUMS: u32 = 2;
-const SIDEBAR_ARTISTS: u32 = 3;
-const SIDEBAR_PLAYLISTS: u32 = 4;
-const SIDEBAR_TRACKS: u32 = 5;
+use std::collections::HashMap;
 
 #[derive(Clone)]
 pub struct AppShell {
@@ -115,57 +110,33 @@ impl AppShell {
         spinner_box.append(&spinner);
         spinner_box.append(&waiting_label);
 
-        let sidebar = adw::Sidebar::new();
+        let sidebar = gtk4::ListBox::builder()
+            .selection_mode(gtk4::SelectionMode::Single)
+            .css_classes(vec!["navigation-sidebar"])
+            .build();
 
-        let queue_section = adw::SidebarSection::new();
+        let queue_row = nav_row("Queue", "open-menu-symbolic");
+        sidebar.append(&queue_row);
+        let discover_row = nav_row("Discover", "org.gnome.Epiphany-symbolic");
+        sidebar.append(&discover_row);
+        let library_header = section_header("Library");
+        sidebar.append(&library_header);
+        let albums_row = nav_row("Albums", "media-optical-symbolic");
+        sidebar.append(&albums_row);
+        let artists_row = nav_row("Artists", "system-users-symbolic");
+        sidebar.append(&artists_row);
+        let playlists_row = nav_row("Playlists", "view-list-symbolic");
+        sidebar.append(&playlists_row);
+        let tracks_row = nav_row("Tracks", "folder-music-symbolic");
+        sidebar.append(&tracks_row);
 
-        queue_section.append(
-            adw::SidebarItem::builder()
-                .title("Queue")
-                .icon_name("open-menu-symbolic")
-                .build(),
-        );
-
-        queue_section.append(
-            adw::SidebarItem::builder()
-                .title("Discover")
-                .icon_name("org.gnome.Epiphany-symbolic")
-                .build(),
-        );
-
-        let library_section = adw::SidebarSection::new();
-        library_section.set_title(Some("Library"));
-
-        library_section.append(
-            adw::SidebarItem::builder()
-                .title("Albums")
-                .icon_name("media-optical-symbolic")
-                .build(),
-        );
-
-        library_section.append(
-            adw::SidebarItem::builder()
-                .title("Artists")
-                .icon_name("system-users-symbolic")
-                .build(),
-        );
-
-        library_section.append(
-            adw::SidebarItem::builder()
-                .title("Playlists")
-                .icon_name("view-list-symbolic")
-                .build(),
-        );
-
-        library_section.append(
-            adw::SidebarItem::builder()
-                .title("Tracks")
-                .icon_name("folder-music-symbolic")
-                .build(),
-        );
-
-        sidebar.append(queue_section);
-        sidebar.append(library_section);
+        let mut nav_rows: HashMap<String, gtk4::ListBoxRow> = HashMap::new();
+        nav_rows.insert("queue".into(), queue_row);
+        nav_rows.insert("discover".into(), discover_row);
+        nav_rows.insert("albums".into(), albums_row);
+        nav_rows.insert("artists".into(), artists_row);
+        nav_rows.insert("playlists".into(), playlists_row);
+        nav_rows.insert("tracks".into(), tracks_row);
         let sidebar_header = adw::HeaderBar::new();
         sidebar_header.set_show_end_title_buttons(false);
 
@@ -282,9 +253,16 @@ impl AppShell {
             .halign(gtk4::Align::Fill)
             .build();
 
+        let sidebar_scroller = gtk4::ScrolledWindow::builder()
+            .vexpand(true)
+            .hexpand(true)
+            .propagate_natural_height(true)
+            .build();
+        sidebar_scroller.set_child(Some(&sidebar));
+
         let sidebar_toolbar = adw::ToolbarView::new();
         sidebar_toolbar.add_top_bar(&sidebar_header);
-        sidebar_toolbar.set_content(Some(&sidebar));
+        sidebar_toolbar.set_content(Some(&sidebar_scroller));
 
         let content_toolbar = adw::ToolbarView::new();
         content_toolbar.add_top_bar(&content_header);
@@ -322,34 +300,30 @@ impl AppShell {
             }
         });
 
-        sidebar.connect_selected_notify({
+        sidebar.connect_row_selected({
             let stack = stack.clone();
             let search_button = search_button.clone();
+            let nav_rows = nav_rows.clone();
 
-            move |sb| {
-                let idx = sb.selected();
-
-                if idx == gtk4::INVALID_LIST_POSITION {
+            move |_sb, row| {
+                let Some(row) = row else {
                     return;
-                }
+                };
 
                 search_button.set_active(false);
 
-                match idx {
-                    SIDEBAR_QUEUE => stack.set_visible_child_name("queue"),
-                    SIDEBAR_DISCOVER => stack.set_visible_child_name("discover"),
-                    SIDEBAR_ALBUMS => stack.set_visible_child_name("albums"),
-                    SIDEBAR_ARTISTS => stack.set_visible_child_name("artists"),
-                    SIDEBAR_PLAYLISTS => stack.set_visible_child_name("playlists"),
-                    SIDEBAR_TRACKS => stack.set_visible_child_name("tracks"),
-
-                    _ => {}
+                for (page, nav_row) in &nav_rows {
+                    if nav_row == row {
+                        stack.set_visible_child_name(page);
+                        break;
+                    }
                 }
             }
         });
 
         stack.connect_visible_child_notify({
             let sidebar = sidebar.clone();
+            let nav_rows = nav_rows.clone();
             let search_button = search_button;
             let filter_button = filter_button;
             let filter_entry = filter_entry;
@@ -362,7 +336,17 @@ impl AppShell {
                     return;
                 };
 
-                match visible_name.as_str() {
+                let name = visible_name.as_str();
+
+                // Keep the sidebar highlight in sync with the visible page.
+                if let Some(row) = nav_rows.get(name) {
+                    sidebar.select_row(Some(row));
+                } else {
+                    // "search" (and unknown pages) clear the highlight.
+                    sidebar.unselect_all();
+                }
+
+                match name {
                     "queue" => {
                         filter_button.set_active(false);
                         filter_button.set_visible(false);
@@ -371,10 +355,6 @@ impl AppShell {
 
                         content_title.set_title("Queue");
                         content_header.set_title_widget(Some(&content_title));
-
-                        if sidebar.selected() != SIDEBAR_QUEUE {
-                            sidebar.set_selected(SIDEBAR_QUEUE);
-                        }
                     }
                     "discover" => {
                         filter_button.set_active(false);
@@ -384,10 +364,6 @@ impl AppShell {
 
                         content_title.set_title("Discover");
                         content_header.set_title_widget(Some(&content_title));
-
-                        if sidebar.selected() != SIDEBAR_DISCOVER {
-                            sidebar.set_selected(SIDEBAR_DISCOVER);
-                        }
                     }
                     "albums" => {
                         filter_button.set_visible(true);
@@ -400,10 +376,6 @@ impl AppShell {
                             content_header.set_title_widget(Some(&filter_entry));
                         } else {
                             content_header.set_title_widget(Some(&content_title));
-                        }
-
-                        if sidebar.selected() != SIDEBAR_ALBUMS {
-                            sidebar.set_selected(SIDEBAR_ALBUMS);
                         }
                     }
                     "playlists" => {
@@ -418,10 +390,6 @@ impl AppShell {
                         } else {
                             content_header.set_title_widget(Some(&content_title));
                         }
-
-                        if sidebar.selected() != SIDEBAR_PLAYLISTS {
-                            sidebar.set_selected(SIDEBAR_PLAYLISTS);
-                        }
                     }
                     "artists" => {
                         filter_button.set_visible(true);
@@ -434,10 +402,6 @@ impl AppShell {
                             content_header.set_title_widget(Some(&filter_entry));
                         } else {
                             content_header.set_title_widget(Some(&content_title));
-                        }
-
-                        if sidebar.selected() != SIDEBAR_ARTISTS {
-                            sidebar.set_selected(SIDEBAR_ARTISTS);
                         }
                     }
                     "tracks" => {
@@ -452,10 +416,6 @@ impl AppShell {
                         } else {
                             content_header.set_title_widget(Some(&content_title));
                         }
-
-                        if sidebar.selected() != SIDEBAR_TRACKS {
-                            sidebar.set_selected(SIDEBAR_TRACKS);
-                        }
                     }
                     "search" => {
                         filter_button.set_active(false);
@@ -466,17 +426,15 @@ impl AppShell {
                         content_header.set_title_widget(Some(&search_entry));
 
                         search_entry.grab_focus();
-
-                        if sidebar.selected() != gtk4::INVALID_LIST_POSITION {
-                            sidebar.set_selected(gtk4::INVALID_LIST_POSITION);
-                        }
                     }
                     _ => {}
                 }
             }
         });
 
-        sidebar.set_selected(SIDEBAR_ALBUMS);
+        if let Some(albums_row) = nav_rows.get("albums") {
+            sidebar.select_row(Some(albums_row));
+        }
         stack.set_visible_child_name("albums");
 
         Self {
@@ -574,6 +532,43 @@ fn reload_favorites(
             }
         }
     });
+}
+
+fn nav_row(title: &str, icon_name: &str) -> gtk4::ListBoxRow {
+    let row_box = gtk4::Box::builder()
+        .orientation(gtk4::Orientation::Horizontal)
+        .spacing(12)
+        .margin_start(12)
+        .margin_end(12)
+        .margin_top(6)
+        .margin_bottom(6)
+        .build();
+
+    let icon = gtk4::Image::builder().icon_name(icon_name).pixel_size(16).build();
+    let label = gtk4::Label::builder()
+        .label(title)
+        .xalign(0.0)
+        .hexpand(true)
+        .build();
+
+    row_box.append(&icon);
+    row_box.append(&label);
+
+    gtk4::ListBoxRow::builder().child(&row_box).activatable(true).build()
+}
+
+fn section_header(title: &str) -> gtk4::ListBoxRow {
+    let label = gtk4::Label::builder()
+        .label(title.to_uppercase())
+        .xalign(0.0)
+        .margin_start(12)
+        .margin_end(12)
+        .margin_top(12)
+        .margin_bottom(4)
+        .css_classes(vec!["dim-label", "caption"])
+        .build();
+
+    gtk4::ListBoxRow::builder().child(&label).activatable(false).selectable(false).build()
 }
 
 fn show_create_playlist_dialog(
