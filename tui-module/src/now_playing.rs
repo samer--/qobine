@@ -11,6 +11,7 @@ pub struct NowPlayingState {
     pub tracklist_position: usize,
     pub status: Status,
     pub duration_ms: u32,
+    pub volume: f32,
 }
 
 pub fn render(frame: &mut Frame, area: Rect, state: &NowPlayingState) {
@@ -18,7 +19,8 @@ pub fn render(frame: &mut Frame, area: Rect, state: &NowPlayingState) {
         return;
     };
 
-    let block = block(Some(get_status(state.status)));
+    let block = block(Some(get_status(state.status)))
+        .title(Line::from(format_volume(state.volume)).right_aligned());
     let inner = block.inner(area);
 
     frame.render_widget(block, area);
@@ -83,6 +85,11 @@ pub const fn get_status(state: Status) -> &'static str {
         Status::Paused => "Paused ⏸",
         Status::Buffering => "Buffering",
     }
+}
+
+fn format_volume(volume: f32) -> String {
+    let percentage = (volume * 100.0).to_u32().unwrap_or_default();
+    format!("Vol {percentage}%")
 }
 
 fn smooth_gauge(ratio: f64, width: u16) -> String {

@@ -261,6 +261,8 @@ fn render_help(frame: &mut Frame, area: Rect) {
         ["Previous song", "p"],
         ["Jump forward", "f"],
         ["Jump backwards", "b"],
+        ["Volume up", "="],
+        ["Volume down", "-"],
         ["Edit filter", "e"],
         ["Stop edit filter", "escape"],
         ["Select in list", "Up/Down"],

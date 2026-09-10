@@ -9,7 +9,7 @@ use crate::{
     search::SearchState,
 };
 use controls_module::{
-    PositionReceiver, Status, StatusReceiver, TracklistReceiver,
+    PositionReceiver, Status, StatusReceiver, TracklistReceiver, VolumeReceiver,
     controls::Controls,
     models::{Artist, Track},
     tracklist::{Tracklist, TracklistType},
@@ -135,6 +135,7 @@ pub struct App {
     pub position: PositionReceiver,
     pub tracklist: TracklistReceiver,
     pub status: StatusReceiver,
+    pub volume: VolumeReceiver,
     pub current_screen: Tab,
     pub exit: bool,
     pub should_draw: bool,
@@ -173,7 +174,8 @@ impl App {
         let mut event_stream = EventStream::new();
 
         let tracklist = self.tracklist.borrow().clone();
-        self.now_playing = create_now_playing_state(&tracklist, self.now_playing.status);
+        self.now_playing =
+            create_now_playing_state(&tracklist, self.now_playing.status, *self.volume.borrow());
 
         while !self.exit {
             tokio::select! {
@@ -203,7 +205,8 @@ impl App {
                     );
 
                     let status = self.now_playing.status;
-                    let new_state = create_now_playing_state(&tracklist, status);
+                    let new_state =
+                        create_now_playing_state(&tracklist, status, *self.volume.borrow());
 
                     self.now_playing = new_state;
                     self.should_draw = true;
@@ -212,6 +215,11 @@ impl App {
                 Ok(()) = self.status.changed() => {
                     let status = self.status.borrow_and_update();
                     self.now_playing.status = *status;
+                    self.should_draw = true;
+                }
+
+                Ok(()) = self.volume.changed() => {
+                    self.now_playing.volume = *self.volume.borrow_and_update();
                     self.should_draw = true;
                 }
 
@@ -399,6 +407,8 @@ impl App {
                     self.controls.jump_backward();
                     self.should_draw = true;
                 }
+                KeyCode::Char('-') => self.adjust_volume(-0.05),
+                KeyCode::Char('=') => self.adjust_volume(0.05),
                 KeyCode::Char('F') => {
                     self.state = AppState::Focus;
                     self.should_draw = true;
@@ -656,12 +666,22 @@ impl App {
         self.current_screen = Tab::Preferences;
     }
 
+    fn adjust_volume(&mut self, delta: f32) {
+        let current = *self.volume.borrow();
+        self.controls.set_volume((current + delta).clamp(0.0, 1.0));
+        self.should_draw = true;
+    }
+
     const fn exit(&mut self) {
         self.exit = true;
     }
 }
 
-pub fn create_now_playing_state(tracklist: &Tracklist, status: Status) -> NowPlayingState {
+pub fn create_now_playing_state(
+    tracklist: &Tracklist,
+    status: Status,
+    volume: f32,
+) -> NowPlayingState {
     let track = tracklist.current_track().cloned();
     let tracklist_type = tracklist.list_type();
 
@@ -679,6 +699,7 @@ pub fn create_now_playing_state(tracklist: &Tracklist, status: Status) -> NowPla
         status,
         tracklist_position: tracklist.current_position(),
         duration_ms: 0,
+        volume,
     }
 }
 
