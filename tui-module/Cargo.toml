@@ -28,12 +28,9 @@ disconnect-module = { version = "*", path = "../disconnect-module" }
 ratatui.workspace = true
 crossterm.workspace = true
 futures.workspace = true
-ratatui-image.workspace = true
 unicode-width.workspace = true
 tui-big-text.workspace = true
 tui-input.workspace = true
-image.workspace = true
-reqwest.workspace = true
 tokio.workspace = true
 num-traits.workspace = true
 

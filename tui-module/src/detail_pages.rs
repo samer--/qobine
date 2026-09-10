@@ -6,10 +6,7 @@ use ratatui::{
     widgets::{Clear, Paragraph, Scrollbar, ScrollbarOrientation, ScrollbarState},
 };
 
-use crate::{
-    app::{FavoriteIds, NotificationList, Output},
-    image_cache::ImageManager,
-};
+use crate::app::{FavoriteIds, NotificationList, Output};
 
 mod add_track;
 mod album;
@@ -65,7 +62,6 @@ impl Overlay {
         frame: &mut Frame,
         area: Rect,
         favorites: &FavoriteIds,
-        image_cache: &mut ImageManager,
         breadcrumb_titles: &[String],
     ) {
         let [breadcrumb_area, popup_area] =
@@ -79,15 +75,15 @@ impl Overlay {
 
         match self {
             Self::Artist(popup) => {
-                popup.render(frame, popup_area, favorites, image_cache);
+                popup.render(frame, popup_area, favorites);
             }
 
             Self::Album(popup) => {
-                popup.render(frame, popup_area, favorites, image_cache);
+                popup.render(frame, popup_area, favorites);
             }
 
             Self::Playlist(popup) => {
-                popup.render(frame, popup_area, favorites, image_cache);
+                popup.render(frame, popup_area, favorites);
             }
 
             Self::AddTrackToPlaylist(popup) => {
@@ -103,7 +99,7 @@ impl Overlay {
             }
 
             Self::TrackInfo(popup) => {
-                popup.render(frame, popup_area, image_cache);
+                popup.render(frame, popup_area);
             }
         }
     }

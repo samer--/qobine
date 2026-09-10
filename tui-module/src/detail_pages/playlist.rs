@@ -1,13 +1,10 @@
 use controls_module::{controls::Controls, models::Playlist};
-use num_traits::ToPrimitive;
 use player_module::{AppResult, client::StreamClient};
 use ratatui::{crossterm::event::KeyCode, prelude::*, widgets::Paragraph};
-use ratatui_image::StatefulImage;
 
 use crate::{
     app::{FavoriteIds, NotificationList, Output},
-    image_cache::{AppImage, ImageManager},
-    ui::{ALBUM_COVER_GAP, ALBUM_COVER_HEIGHT, ALBUM_COVER_WIDTH, block, format_seconds, tab_bar},
+    ui::{block, format_seconds, tab_bar},
     widgets::track_list::{TrackList, TrackListEvent},
 };
 
@@ -17,7 +14,6 @@ pub struct PlaylistOverlay {
     title: String,
     id: u32,
     is_owned: bool,
-    image_url: Option<String>,
     owner: String,
     duration_seconds: u32,
 }
@@ -30,7 +26,6 @@ impl PlaylistOverlay {
             title: playlist.title,
             id: playlist.id,
             is_owned: playlist.is_owned,
-            image_url: playlist.image,
             owner: playlist.owner.name,
             duration_seconds: playlist.duration_seconds,
         }
@@ -40,14 +35,8 @@ impl PlaylistOverlay {
         &self.title
     }
 
-    pub fn render(
-        &mut self,
-        frame: &mut Frame,
-        area: Rect,
-        favorites: &FavoriteIds,
-        image_cache: &mut ImageManager,
-    ) {
-        let header_height = ALBUM_COVER_HEIGHT + 1;
+    pub fn render(&mut self, frame: &mut Frame, area: Rect, favorites: &FavoriteIds) {
+        let header_height = 4;
         let outer_block = block(Some(&self.title));
 
         frame.render_widget(&outer_block, area);
@@ -61,7 +50,7 @@ impl PlaylistOverlay {
         ])
         .areas(inner);
 
-        self.render_header(frame, header_area, image_cache);
+        self.render_header(frame, header_area);
 
         self.tracks.render(
             tracks_area,
@@ -122,55 +111,7 @@ impl PlaylistOverlay {
         }
     }
 
-    fn render_header(&mut self, frame: &mut Frame, area: Rect, image_cache: &mut ImageManager) {
-        let image = self
-            .image_url
-            .as_ref()
-            .and_then(|url| image_cache.get_mut(url));
-
-        let can_render_cover = image.is_some()
-            && area.width >= ALBUM_COVER_WIDTH.saturating_add(ALBUM_COVER_GAP)
-            && area.height >= ALBUM_COVER_HEIGHT;
-
-        let image_width = image
-            .as_ref()
-            .filter(|_| can_render_cover)
-            .and_then(|image| (image.ratio * f32::from(ALBUM_COVER_HEIGHT * 2)).to_u16())
-            .unwrap_or_default();
-
-        let gap = if can_render_cover { ALBUM_COVER_GAP } else { 0 };
-
-        let [image_area, _, info_area] = Layout::horizontal([
-            Constraint::Length(image_width),
-            Constraint::Length(gap),
-            Constraint::Min(1),
-        ])
-        .areas(area);
-
-        if can_render_cover && let Some(AppImage { protocol, ratio }) = image {
-            let width = ALBUM_COVER_HEIGHT
-                .checked_mul(2)
-                .and_then(|x| x.to_f32())
-                .map(|height| *ratio * height)
-                .and_then(|x| x.to_u16())
-                .unwrap_or_default();
-
-            let y_offset = image_area
-                .height
-                .saturating_sub(ALBUM_COVER_HEIGHT)
-                .checked_div(2)
-                .unwrap_or_default();
-
-            let centered_image_area = Rect::new(
-                image_area.x,
-                image_area.y.saturating_add(y_offset),
-                width.min(image_area.width),
-                ALBUM_COVER_HEIGHT.min(image_area.height),
-            );
-
-            frame.render_stateful_widget(StatefulImage::default(), centered_image_area, protocol);
-        }
-
+    fn render_header(&mut self, frame: &mut Frame, area: Rect) {
         let information = vec![
             Line::from(Span::styled(self.title.clone(), Style::new().bold())),
             Line::from(self.owner.clone()),
@@ -185,7 +126,7 @@ impl PlaylistOverlay {
             )),
         ];
 
-        frame.render_widget(Paragraph::new(information), info_area);
+        frame.render_widget(Paragraph::new(information), area);
     }
 
     async fn delete_selected_track(&mut self, client: &StreamClient) -> AppResult<()> {

@@ -3,7 +3,6 @@ use crate::{
     discover::DiscoverState,
     favorites::FavoritesState,
     genres::GenresState,
-    image_cache::{ImageLoaded, ImageManager},
     now_playing::NowPlayingState,
     preferences::PreferencesState,
     queue::QueueState,
@@ -131,8 +130,6 @@ impl Tab {
 
 pub struct App {
     pub client: Arc<StreamClient>,
-    pub image_cache: ImageManager,
-    pub image_rx: mpsc::UnboundedReceiver<ImageLoaded>,
     pub controls: Controls,
     pub database: Arc<Database>,
     pub position: PositionReceiver,
@@ -211,11 +208,6 @@ impl App {
                     self.now_playing = new_state;
                     self.should_draw = true;
                 },
-
-                Some(message) = self.image_rx.recv() => {
-                    self.image_cache.insert(message);
-                    self.should_draw = true;
-                }
 
                 Ok(()) = self.status.changed() => {
                     let status = self.status.borrow_and_update();

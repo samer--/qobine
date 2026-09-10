@@ -9,12 +9,10 @@ use ratatui::{
     prelude::*,
     widgets::{ListState, Paragraph, ScrollbarState},
 };
-use ratatui_image::StatefulImage;
 
 use super::{OverlayFocus, about_scroll_delta, header_blurb, render_about, scroll_about};
 use crate::{
     app::{FavoriteIds, NotificationList, Output},
-    image_cache::{AppImage, ImageManager},
     ui::{block, mark_as_favorite, sidebar},
     widgets::{
         grid::Grid,
@@ -31,7 +29,6 @@ pub struct ArtistOverlay {
     compilations: Grid<AlbumSimple>,
     similar: Grid<Artist>,
     description: Option<String>,
-    image_url: Option<String>,
     selected_sub_tab: usize,
     about_scroll: ScrollbarState,
     top_tracks: TrackList,
@@ -68,7 +65,6 @@ impl ArtistOverlay {
             compilations: Grid::new(artist_page.compilations),
             similar: Grid::new(artist_page.similar_artists),
             description: artist_page.description,
-            image_url: artist_page.image,
             selected_sub_tab: 0,
             about_scroll: ScrollbarState::default(),
             top_tracks: TrackList::new(artist_page.top_tracks),
@@ -80,14 +76,8 @@ impl ArtistOverlay {
         &self.artist_name
     }
 
-    pub fn render(
-        &mut self,
-        frame: &mut Frame,
-        area: Rect,
-        favorites: &FavoriteIds,
-        image_cache: &mut ImageManager,
-    ) {
-        let header_height = 6;
+    pub fn render(&mut self, frame: &mut Frame, area: Rect, favorites: &FavoriteIds) {
+        let header_height = 4;
         let outer_block = block(Some(&self.artist_name));
 
         frame.render_widget(&outer_block, area);
@@ -97,9 +87,9 @@ impl ArtistOverlay {
         let [header_area, body_area] =
             Layout::vertical([Constraint::Length(header_height), Constraint::Min(1)]).areas(inner);
 
-        self.render_header(frame, header_area, favorites, image_cache);
+        self.render_header(frame, header_area, favorites);
 
-        self.render_body(frame, body_area, favorites, image_cache);
+        self.render_body(frame, body_area, favorites);
     }
 
     pub async fn handle_event(
@@ -119,36 +109,7 @@ impl ArtistOverlay {
         }
     }
 
-    fn render_header(
-        &mut self,
-        frame: &mut Frame,
-        area: Rect,
-        favorites: &FavoriteIds,
-        image_cache: &mut ImageManager,
-    ) {
-        let image = self
-            .image_url
-            .as_ref()
-            .and_then(|url| image_cache.get_mut(url));
-
-        let image_width = image
-            .as_ref()
-            .and_then(|image| (image.ratio * f32::from(area.height.saturating_mul(2))).to_u16())
-            .unwrap_or_default();
-
-        let gap = if image_width > 0 { 2 } else { 0 };
-
-        let [image_area, _, info_area] = Layout::horizontal([
-            Constraint::Length(image_width),
-            Constraint::Length(gap),
-            Constraint::Min(1),
-        ])
-        .areas(area);
-
-        if let Some(AppImage { protocol, .. }) = image {
-            frame.render_stateful_widget(StatefulImage::default(), image_area, protocol);
-        }
-
+    fn render_header(&mut self, frame: &mut Frame, area: Rect, favorites: &FavoriteIds) {
         let name = Line::from(Span::styled(self.artist_name.clone(), Style::new().bold()));
 
         let name = mark_as_favorite(name, favorites.artists().contains(&self.id));
@@ -159,7 +120,7 @@ impl ArtistOverlay {
             Constraint::Length(1),
             Constraint::Min(0),
         ])
-        .areas(info_area);
+        .areas(area);
 
         frame.render_widget(Paragraph::new(name), name_area);
 
@@ -185,13 +146,7 @@ impl ArtistOverlay {
         );
     }
 
-    fn render_body(
-        &mut self,
-        frame: &mut Frame,
-        area: Rect,
-        favorites: &FavoriteIds,
-        image_cache: &mut ImageManager,
-    ) {
+    fn render_body(&mut self, frame: &mut Frame, area: Rect, favorites: &FavoriteIds) {
         let (sidebar_widget, sidebar_width) =
             sidebar(self.tabs(), self.focus == OverlayFocus::Sidebar);
 
@@ -232,7 +187,6 @@ impl ArtistOverlay {
                                 frame.buffer_mut(),
                                 true,
                                 favorites.albums(),
-                                image_cache,
                             );
                         }
 
@@ -252,7 +206,6 @@ impl ArtistOverlay {
                                 frame.buffer_mut(),
                                 true,
                                 favorites.artists(),
-                                image_cache,
                             );
                         }
                     }

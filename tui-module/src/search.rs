@@ -12,7 +12,6 @@ use tui_input::{Input, backend::crossterm::EventHandler};
 
 use crate::{
     app::{FavoriteIds, NotificationList, Output},
-    image_cache::ImageManager,
     sub_tab::SubTab,
     ui::{block, render_input, sidebar},
     widgets::{
@@ -41,13 +40,7 @@ pub struct SearchState {
 }
 
 impl SearchState {
-    pub fn render(
-        &mut self,
-        frame: &mut Frame,
-        area: Rect,
-        favorites: &FavoriteIds,
-        image_cache: &mut ImageManager,
-    ) {
+    pub fn render(&mut self, frame: &mut Frame, area: Rect, favorites: &FavoriteIds) {
         let [input_area, content_area] = Layout::default()
             .constraints([Constraint::Length(3), Constraint::Min(1)])
             .areas(area);
@@ -88,21 +81,18 @@ impl SearchState {
                 frame.buffer_mut(),
                 content_focused,
                 favorites.albums(),
-                image_cache,
             ),
             SubTab::Artists => self.artists.render(
                 content_area,
                 frame.buffer_mut(),
                 content_focused,
                 favorites.artists(),
-                image_cache,
             ),
             SubTab::Playlists => self.playlists.render(
                 content_area,
                 frame.buffer_mut(),
                 content_focused,
                 favorites.playlists(),
-                image_cache,
             ),
             SubTab::Tracks => self.tracks.render(
                 content_area,
