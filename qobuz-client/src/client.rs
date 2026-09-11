@@ -365,6 +365,64 @@ impl QobuzClient {
         self.user_id
     }
 
+    /// Discover the Qobuz Connect WebSocket endpoint + JWT via `/qws/createToken`.
+    ///
+    /// Returns `(endpoint_url, jwt_qws)`. This is what registers this client as a
+    /// Qobuz Connect device on the cloud (same account as `user_token`).
+    pub async fn create_qws_token(&self) -> Result<(String, String)> {
+        let endpoint = format!("{}qws/createToken", self.base_url);
+
+        let headers = client_headers(&self.app_id, Some(&self.user_token))?;
+
+        let response = self
+            .http_client
+            .request(Method::POST, &endpoint)
+            .headers(headers)
+            .form(&[
+                ("jwt", "jwt_qws"),
+                ("user_auth_token_needed", "true"),
+                ("strong_auth_needed", "true"),
+            ])
+            .send()
+            .await?;
+
+        let status = response.status();
+        let body = response.text().await?;
+
+        if !status.is_success() {
+            let preview: String = body.trim().chars().take(300).collect();
+            return Err(Error::Api {
+                message: format!("qws/createToken status {status}: {preview}"),
+            });
+        }
+
+        let payload: Value = serde_json::from_str(&body).map_err(|err| Error::DeserializeJSON {
+            message: format!("qws/createToken response decode failed: {err}"),
+        })?;
+
+        let jwt_qws = payload.get("jwt_qws").ok_or_else(|| Error::Api {
+            message: "qws/createToken response missing jwt_qws payload".to_string(),
+        })?;
+
+        let endpoint_url = jwt_qws
+            .get("endpoint")
+            .and_then(Value::as_str)
+            .map(ToString::to_string)
+            .ok_or_else(|| Error::Api {
+                message: "qws/createToken response missing jwt_qws.endpoint".to_string(),
+            })?;
+
+        let jwt = jwt_qws
+            .get("jwt")
+            .and_then(Value::as_str)
+            .map(ToString::to_string)
+            .ok_or_else(|| Error::Api {
+                message: "qws/createToken response missing jwt_qws.jwt".to_string(),
+            })?;
+
+        Ok((endpoint_url, jwt))
+    }
+
     pub async fn genres(&self) -> Result<GenreResponse> {
         let endpoint = format!("{}{}", self.base_url, Endpoint::GenreList);
         self.get(&endpoint, None).await

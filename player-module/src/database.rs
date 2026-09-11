@@ -244,6 +244,24 @@ impl Database {
         Ok(())
     }
 
+    pub async fn set_connect_device_uuid(&self, device_uuid: &str) -> AppResult<()> {
+        sqlx::query("update configuration set connect_device_uuid = ?1 where rowid = 1")
+            .bind(device_uuid)
+            .execute(&self.pool)
+            .await?;
+
+        Ok(())
+    }
+
+    pub async fn get_connect_device_uuid(&self) -> AppResult<Option<String>> {
+        let row: Option<String> =
+            sqlx::query_scalar("select connect_device_uuid from configuration where rowid = 1")
+                .fetch_one(&self.pool)
+                .await?;
+
+        Ok(row)
+    }
+
     pub async fn get_credentials(&self) -> AppResult<Option<Credentials>> {
         let credentials = sqlx::query_as!(
             DatabaseCredentials,

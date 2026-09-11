@@ -1,18 +1,36 @@
-use std::time::{Duration, SystemTime};
+use std::sync::Arc;
+use std::time::Duration;
 
 use controls_module::{
     PositionReceiver, Status, StatusReceiver, TracklistReceiver, VolumeReceiver,
     controls::{Controls, NewQueueItem},
     tracklist::Tracklist,
 };
-
-use num_traits::ToPrimitive;
-use player_module::{AppResult, AudioQuality, error::PlayerError};
-use qonductor::{
-    ActivationState, BufferState, Command, DeviceConfig, DeviceSession, Notification, PlayingState,
-    SessionEvent, SessionManager,
-    msg::{self, Position, QueueRendererState, report::VolumeChanged},
+use player_module::{
+    AppResult, AudioQuality, client::StreamClient, database::Database, error::PlayerError,
 };
+use qconnect_protocol::{
+    QueueCommand, QueueCommandType, QueueEventType, QueueServerEvent, QueueVersion,
+    RendererCommandType, RendererReport, RendererReportType, RendererServerCommand,
+    build_qconnect_outbound_envelope, build_qconnect_renderer_outbound_envelope,
+};
+use qconnect_transport_ws::{
+    NativeWsTransport, TransportEvent, WsTransport, WsTransportConfig, WsTransportError,
+};
+use serde_json::{Value, json};
+use tokio::sync::broadcast::error::RecvError;
+use uuid::Uuid;
+
+const PLAYING_STATE_STOPPED: i64 = 1;
+const PLAYING_STATE_PLAYING: i64 = 2;
+const PLAYING_STATE_PAUSED: i64 = 3;
+
+const BUFFER_STATE_BUFFERING: i32 = 1;
+const BUFFER_STATE_OK: i32 = 2;
+
+const DEVICE_TYPE_COMPUTER: i32 = 5;
+
+const SUBSCRIBE_CHANNELS: [u8; 3] = [0x01, 0x02, 0x03];
 
 struct ConnectState {
     controls: Controls,
@@ -20,14 +38,18 @@ struct ConnectState {
     tracklist_receiver: TracklistReceiver,
     status_receiver: StatusReceiver,
     volume_receiver: VolumeReceiver,
-    audio_quality: i32,
-    connected: bool,
+    max_audio_quality: i32,
+    queue_version: QueueVersion,
+    connect_name: String,
+    device_uuid: String,
+    session_uuid: Option<String>,
+    renderer_joined: bool,
 }
 
 pub async fn init(
-    app_id: &str,
+    client: Arc<StreamClient>,
+    database: Arc<Database>,
     connect_name: String,
-    connect_port: u16,
     controls: Controls,
     position_receiver: PositionReceiver,
     tracklist_receiver: TracklistReceiver,
@@ -35,66 +57,35 @@ pub async fn init(
     volume_receiver: VolumeReceiver,
     max_audio_quality: AudioQuality,
 ) -> AppResult<()> {
-    let audio_quality = convert_audio_quality(max_audio_quality);
+    let (endpoint, jwt) = client.create_qws_token().await?;
 
-    let mut connect_state = ConnectState {
+    let device_uuid = resolve_device_uuid(&database).await?;
+
+    let mut state = ConnectState {
         controls,
         position_receiver,
         tracklist_receiver,
         status_receiver,
-        volume_receiver: volume_receiver.clone(),
-        audio_quality,
-        connected: false,
+        volume_receiver,
+        max_audio_quality: convert_audio_quality(max_audio_quality),
+        queue_version: QueueVersion::new(1, 0),
+        connect_name,
+        device_uuid,
+        session_uuid: None,
+        renderer_joined: false,
     };
 
-    connect_state
-        .run(app_id, connect_name, connect_port)
-        .await
-        .map_err(|x| map_err(&x))?;
-
-    Ok(())
+    state.run(&endpoint, &jwt).await
 }
 
-fn current_state(status: Status, position: &Duration, tracklist: &Tracklist) -> QueueRendererState {
-    let mut response_state = msg::QueueRendererState::default();
+async fn resolve_device_uuid(database: &Database) -> AppResult<String> {
+    if let Some(uuid) = database.get_connect_device_uuid().await? {
+        return Ok(uuid);
+    }
 
-    let current_state = match status {
-        Status::Playing => PlayingState::Playing,
-        Status::Buffering | Status::Paused => PlayingState::Paused,
-    };
-
-    let buffering_state = match status {
-        Status::Playing | Status::Paused => BufferState::Ok,
-        Status::Buffering => BufferState::Buffering,
-    };
-
-    response_state.current_queue_item_id = tracklist
-        .current_queue_id()
-        .and_then(|x| i32::try_from(x).ok());
-    response_state.next_queue_item_id = tracklist
-        .next_track_queue_id()
-        .and_then(|x| i32::try_from(x).ok());
-
-    response_state.set_playing_state(current_state);
-    response_state.set_buffer_state(buffering_state);
-
-    let timestamp = SystemTime::now()
-        .duration_since(SystemTime::UNIX_EPOCH)
-        .ok()
-        .and_then(|x| u64::try_from(x.as_millis()).ok());
-
-    let position = u32::try_from(position.as_millis()).ok();
-    response_state.current_position = Some(Position {
-        timestamp,
-        value: position,
-    });
-
-    let current_duration_ms = tracklist
-        .current_track()
-        .map(|x| x.duration_seconds.saturating_mul(1000));
-    response_state.duration = current_duration_ms;
-
-    response_state
+    let uuid = Uuid::new_v4().to_string();
+    database.set_connect_device_uuid(&uuid).await?;
+    Ok(uuid)
 }
 
 const fn convert_audio_quality(max_audio_quality: AudioQuality) -> i32 {
@@ -107,315 +98,414 @@ const fn convert_audio_quality(max_audio_quality: AudioQuality) -> i32 {
 }
 
 fn convert_volume(volume: f32) -> u32 {
-    (volume * 100.0).clamp(0.0, 100.0).to_u32().unwrap_or(0)
+    (volume * 100.0).clamp(0.0, 100.0).round() as u32
+}
+
+fn device_info_json(friendly_name: &str, device_uuid: &str, max_audio_quality: i32) -> Value {
+    json!({
+        "device_uuid": device_uuid,
+        "friendly_name": friendly_name,
+        "brand": "qobine",
+        "model": "qobine",
+        "serial_number": null,
+        "device_type": DEVICE_TYPE_COMPUTER,
+        "capabilities": {
+            "min_audio_quality": 1,
+            "max_audio_quality": max_audio_quality,
+            "volume_remote_control": 2,
+        },
+        "software_version": format!("qobine/{}", env!("CARGO_PKG_VERSION")),
+    })
+}
+
+fn parse_queue_items(payload: &Value, key: &str) -> Vec<NewQueueItem> {
+    let Some(tracks) = payload.get(key).and_then(Value::as_array) else {
+        return Vec::new();
+    };
+
+    tracks
+        .iter()
+        .filter_map(|track| {
+            let track_id = track.get("track_id").and_then(Value::as_u64)?;
+            let queue_id = track
+                .get("queue_item_id")
+                .and_then(Value::as_u64)
+                .unwrap_or(0);
+
+            Some(NewQueueItem {
+                track_id: u32::try_from(track_id).ok()?,
+                queue_id,
+            })
+        })
+        .collect()
+}
+
+fn state_report_payload(
+    status: Status,
+    position: &Duration,
+    tracklist: &Tracklist,
+    queue_version: QueueVersion,
+) -> Value {
+    let playing_state = match status {
+        Status::Playing => PLAYING_STATE_PLAYING,
+        Status::Buffering | Status::Paused => PLAYING_STATE_PAUSED,
+    };
+
+    let buffer_state = match status {
+        Status::Playing | Status::Paused => BUFFER_STATE_OK,
+        Status::Buffering => BUFFER_STATE_BUFFERING,
+    };
+
+    let position_ms = u64::try_from(position.as_millis()).ok();
+    let duration_ms = tracklist
+        .current_track()
+        .map(|x| u64::from(x.duration_seconds).saturating_mul(1000));
+
+    json!({
+        "playing_state": playing_state,
+        "buffer_state": buffer_state,
+        "current_position": position_ms,
+        "duration": duration_ms,
+        "current_queue_item_id": tracklist.current_queue_id(),
+        "next_queue_item_id": tracklist.next_track_queue_id(),
+        "queue_version": {
+            "major": queue_version.major,
+            "minor": queue_version.minor,
+        },
+    })
+}
+
+fn map_ws_err(err: &WsTransportError) -> PlayerError {
+    PlayerError::ConnectError {
+        error: err.to_string(),
+    }
 }
 
 impl ConnectState {
-    async fn handle_position_changed(&mut self, session: &DeviceSession) -> qonductor::Result<()> {
-        if !self.connected {
-            return Ok(());
-        }
-        let position = {
-            let position = self.position_receiver.borrow_and_update();
-            *position
-        };
-        let status = { *self.status_receiver.borrow() };
-        let tracklist = self.tracklist_receiver.borrow().clone();
+    async fn run(&mut self, endpoint: &str, jwt: &str) -> AppResult<()> {
+        let mut config = WsTransportConfig::default();
+        config.endpoint_url = endpoint.to_string();
+        config.jwt_qws = Some(jwt.to_string());
+        config.require_jwt = true;
+        config.reconnect_idle_retry_ms = 60_000;
+        config.subscribe_channels = SUBSCRIBE_CHANNELS.iter().map(|c| vec![*c]).collect();
 
-        let new_state = current_state(status, &position, &tracklist);
+        let transport = NativeWsTransport::new();
+        let mut events = transport.subscribe();
 
-        session.report_state(new_state).await?;
-        Ok(())
-    }
+        transport.connect(config).await.map_err(|err| map_ws_err(&err))?;
 
-    async fn handle_tracklist_changed(&mut self, session: &DeviceSession) -> qonductor::Result<()> {
-        if !self.connected {
-            return Ok(());
-        }
-        let tracklist = self.tracklist_receiver.borrow_and_update().clone();
-        let position = {
-            let position = self.position_receiver.borrow();
-            *position
-        };
-        let status = { *self.status_receiver.borrow() };
-        let new_state = current_state(status, &position, &tracklist);
+        self.send_controller_join(&transport).await?;
 
-        tracing::info!("Updating current state after tracklist change");
-        session.report_state(new_state).await?;
-        Ok(())
-    }
-
-    async fn handle_volume_changed(&mut self, session: &DeviceSession) -> qonductor::Result<()> {
-        if !self.connected {
-            return Ok(());
-        }
-        let volume = convert_volume(*self.volume_receiver.borrow_and_update());
-        tracing::info!("Updating volume state after volume change");
-        session.report_volume(volume).await?;
-        Ok(())
-    }
-
-    async fn handle_status_changed(&mut self, session: &DeviceSession) -> qonductor::Result<()> {
-        if !self.connected {
-            return Ok(());
-        }
-        let position = {
-            let position = self.position_receiver.borrow();
-            *position
-        };
-        let status = { *self.status_receiver.borrow_and_update() };
-        let tracklist = self.tracklist_receiver.borrow().clone();
-        let new_state = current_state(status, &position, &tracklist);
-        session.report_state(new_state).await?;
-        Ok(())
-    }
-
-    async fn run(
-        &mut self,
-        app_id: &str,
-        connect_name: String,
-        connect_port: u16,
-    ) -> qonductor::Result<()> {
-        let mut manager = SessionManager::start(connect_port, app_id).await?;
-
-        let mut session = manager.add_device(DeviceConfig::new(connect_name)).await?;
-
-        tokio::spawn(async move { manager.run().await });
+        let mut heartbeat = tokio::time::interval(Duration::from_secs(10));
+        heartbeat.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
         loop {
             tokio::select! {
-                Some(event) = session.recv() => {
-                    self.handle_event(event);
+                event = events.recv() => {
+                    match event {
+                        Ok(event) => self.handle_transport_event(&transport, event).await,
+                        Err(RecvError::Lagged(_)) => {}
+                        Err(RecvError::Closed) => break,
+                    }
                 }
                 Ok(()) = self.position_receiver.changed() => {
-                    self.handle_position_changed(&session).await?;
-                },
+                    self.report_state(&transport).await;
+                }
                 Ok(()) = self.tracklist_receiver.changed() => {
-                    self.handle_tracklist_changed(&session).await?;
-                },
-                Ok(()) = self.volume_receiver.changed() => {
-                    self.handle_volume_changed(&session).await?;
+                    self.report_state(&transport).await;
                 }
                 Ok(()) = self.status_receiver.changed() => {
-                    self.handle_status_changed(&session).await?;
+                    self.report_state(&transport).await;
+                }
+                Ok(()) = self.volume_receiver.changed() => {
+                    self.report_volume(&transport).await;
+                }
+                _ = heartbeat.tick() => {
+                    self.report_state(&transport).await;
                 }
             }
         }
+
+        Ok(())
     }
 
-    fn handle_event(&mut self, event: SessionEvent) {
+    async fn handle_transport_event(&mut self, transport: &NativeWsTransport, event: TransportEvent) {
         match event {
-            SessionEvent::Command(command) => match command {
-                Command::SetState { cmd, respond } => {
-                    tracing::info!("Set state message received");
-                    tracing::info!("{:?}", cmd);
-                    let response = msg::QueueRendererState::default();
-
-                    match cmd.playing_state() {
-                        PlayingState::Stopped | PlayingState::Paused => {
-                            self.controls.pause();
-                        }
-                        PlayingState::Playing => {
-                            self.controls.play();
-                        }
-                        PlayingState::Unknown => {
-                            // don't change current playing state, used for seeking
-                        }
-                    }
-
-                    let position = cmd
-                        .current_position
-                        .map(|x| Duration::from_millis(x.into()));
-
-                    if let Some(position) = position {
-                        tracing::info!("Seeking from connect message");
-                        self.controls.seek(position);
-                    }
-
-                    let current_queue_id = self.tracklist_receiver.borrow().current_queue_id();
-
-                    let tracklist_position = cmd
-                        .current_queue_item
-                        .map(|x| x.queue_item_id)
-                        .and_then(|x| usize::try_from(x).ok());
-
-                    if let Some(tracklist_position) = tracklist_position
-                        && let Some(current_queue_id) = current_queue_id
-                        && Some(current_queue_id) != u64::try_from(tracklist_position).ok()
-                    {
-                        self.controls.skip_to_position(tracklist_position, true);
-                    }
-
-                    respond.send(response);
-                }
-                Command::SetActive { respond, cmd: _cmd } => {
-                    tracing::info!("Device activated!");
-
-                    let current_volume = convert_volume(*self.volume_receiver.borrow());
-                    let position = self.position_receiver.borrow();
-                    let tracklist = self.tracklist_receiver.borrow();
-                    let response =
-                        current_state(*self.status_receiver.borrow(), &position, &tracklist);
-
-                    respond.send(ActivationState {
-                        muted: false,
-                        volume: current_volume,
-                        max_quality: self.audio_quality,
-                        playback: response,
-                    });
-                }
-                Command::SetVolume { cmd, respond } => {
-                    let volume = cmd.volume.and_then(|x| x.to_f32());
-                    tracing::info!("Volume command received: {:?}", volume);
-
-                    let current_volume = *self.volume_receiver.borrow() * 100.0;
-
-                    if let Some(volume) = volume
-                        && (volume - current_volume).abs() > 1.0
-                    {
-                        self.controls.set_volume(volume / 100.0);
-                    }
-
-                    let volume = volume.and_then(|x| x.to_u32());
-
-                    respond.send(VolumeChanged { volume });
-                }
-                Command::Heartbeat { respond } => {
-                    let status = self.status_receiver.borrow();
-                    let position = self.position_receiver.borrow();
-                    let tracklist = self.tracklist_receiver.borrow();
-                    let response = match *status {
-                        Status::Playing | Status::Buffering => {
-                            Some(current_state(*status, &position, &tracklist))
-                        }
-                        Status::Paused => None,
-                    };
-
-                    tracing::info!("Sending heartbeat");
-                    respond.send(response);
-                }
-            },
-            SessionEvent::Notification(n) => match n {
-                Notification::Connected => {
-                    self.connected = true;
-                    tracing::info!("Connected!");
-                }
-                Notification::DeviceRegistered { renderer_id, .. } => {
-                    tracing::info!("Ignoring device registered as renderer {}", renderer_id);
-                }
-                Notification::QueueState(queue) => {
-                    let queue_items = queue
-                        .tracks
-                        .into_iter()
-                        .map(|x| NewQueueItem {
-                            track_id: x.track_id(),
-                            queue_id: x.queue_item_id,
-                        })
-                        .collect();
-                    self.controls.new_queue(queue_items, false, None);
-                }
-                Notification::SessionState(session_state) => {
-                    tracing::info!("Ignoring session state message: {:?}", session_state);
-                }
-                Notification::QueueCleared(_) => {
-                    self.controls.clear_queue();
-                }
-                Notification::QueueLoadTracks(queue) => {
-                    tracing::info!("Queue load tracks: {:?}", queue);
-
-                    let queue_items = queue
-                        .tracks
-                        .into_iter()
-                        .map(|x| NewQueueItem {
-                            track_id: x.track_id(),
-                            queue_id: x.queue_item_id,
-                        })
-                        .collect();
-
-                    let start_index = queue.queue_position.and_then(|x| usize::try_from(x).ok());
-                    self.controls.new_queue(queue_items, false, start_index);
-
-                    self.controls.play();
-                }
-                Notification::QueueTracksAdded(queue_tracks_added) => {
-                    // Added in end of queue
-                    tracing::info!("Queue tracks added: {:?}", queue_tracks_added);
-                }
-                Notification::QueueTracksInserted(queue_tracks_inserted) => {
-                    // Next in queue
-                    tracing::info!("Queue tracks inserted: {:?}", queue_tracks_inserted);
-                }
-                Notification::QueueTracksRemoved(queue_tracks_removed) => {
-                    tracing::info!("Queue tracks removed: {:?}", queue_tracks_removed);
-                }
-                Notification::QueueTracksReordered(reordered) => {
-                    tracing::info!("Queue tracks reordered: {:?}", reordered);
-                }
-                Notification::VolumeChanged(volume) => {
-                    tracing::info!("Volume changed: {:?}", volume);
-                }
-                Notification::AutoplayModeSet(_) => {
-                    tracing::info!("Error. Autoplay not supported");
-                }
-                Notification::AutoplayTracksLoaded(_) => {
-                    tracing::info!("Error. Autoplay not supported");
-                }
-                Notification::LoopModeSet(_) => {
-                    tracing::info!("Error. Loop mode not supported");
-                }
-                Notification::ShuffleModeSet(_) => {
-                    tracing::info!("Error. Shuffle not supported");
-                }
-                Notification::ActiveRendererChanged(_) => {
-                    tracing::info!("Error. Active renderer not supported");
-                }
-                Notification::AddRenderer(_) => {
-                    tracing::info!("Error. Add renderer not supported");
-                }
-                Notification::UpdateRenderer(_) => {
-                    tracing::info!("Error. Update renderer not supported");
-                }
-                Notification::RemoveRenderer(_) => {
-                    tracing::info!("Error. Remove renderer not supported");
-                }
-                Notification::RendererStateUpdated(_state_msg) => {
-                    // TODO: This will be needed when qobine is used as a controller
-                    // let state = state_msg.state;
-                    // tracing::info!("Error. Renderer state not supported: {:?}", state);
-                }
-                Notification::VolumeMuted(_) => {
-                    tracing::info!("Error. Muting not supported");
-                }
-                Notification::MaxAudioQualityChanged(_) => {
-                    tracing::info!("Error. Audio quality change in runtime is not supported");
-                }
-                Notification::FileAudioQualityChanged(_) => {
-                    tracing::info!("Error. Audio quality change in runtime is not supported");
-                }
-                Notification::DeviceAudioQualityChanged(_) => {
-                    tracing::info!("Error. Audio quality change in runtime is not supported");
-                }
-                Notification::Deactivated => {
-                    tracing::info!("Error. Deactivate not supported. Exit?");
-                }
-                Notification::RestoreState(srvr_ctrl_renderer_state_updated) => {
-                    tracing::info!("Restore state: {:?}", srvr_ctrl_renderer_state_updated);
-                }
-                Notification::Disconnected { session_id, reason } => {
-                    tracing::info!("Disconnect: {}, {:?}", session_id, reason);
-                    self.connected = false;
-                }
-                Notification::SessionClosed { device_uuid } => {
-                    tracing::info!("Session closed: {:?}", device_uuid);
-                }
-                _ => {}
-            },
+            TransportEvent::InboundQueueServerEvent(event) => {
+                self.handle_queue_event(transport, event).await;
+            }
+            TransportEvent::InboundRendererServerCommand(command) => {
+                self.handle_renderer_command(transport, command).await;
+            }
+            TransportEvent::SessionEstablished => {
+                tracing::info!("Qobuz Connect session established");
+            }
+            TransportEvent::Disconnected => {
+                tracing::info!("Qobuz Connect disconnected");
+            }
+            TransportEvent::CloudError { code, descr, .. } => {
+                tracing::warn!("Qobuz cloud error: code={code} descr={descr:?}");
+            }
+            TransportEvent::MaxReconnectAttemptsExceeded {
+                attempts,
+                last_reason,
+            } => {
+                tracing::warn!("Qobuz Connect reconnect attempts exceeded ({attempts}): {last_reason}");
+            }
+            _ => {}
         }
     }
-}
 
-fn map_err(err: &qonductor::Error) -> PlayerError {
-    PlayerError::ConnectError {
-        error: err.to_string(),
+    async fn handle_queue_event(&mut self, transport: &NativeWsTransport, event: QueueServerEvent) {
+        if let Some(queue_version) = event.queue_version {
+            self.queue_version = queue_version;
+        }
+
+        match event.event_type {
+            QueueEventType::SrvrCtrlSessionState => {
+                if let Some(session_uuid) = event.payload.get("session_uuid").and_then(Value::as_str) {
+                    if self.session_uuid.as_deref() != Some(session_uuid) {
+                        self.session_uuid = Some(session_uuid.to_string());
+                        self.send_renderer_join(transport, session_uuid).await;
+                    }
+                }
+            }
+            QueueEventType::SrvrCtrlQueueState => {
+                let items = parse_queue_items(&event.payload, "tracks");
+                self.controls.new_queue(items, false, None);
+            }
+            QueueEventType::SrvrCtrlQueueTracksLoaded => {
+                let items = parse_queue_items(&event.payload, "tracks");
+                let start_index = event
+                    .payload
+                    .get("queue_position")
+                    .and_then(Value::as_u64)
+                    .and_then(|x| usize::try_from(x).ok());
+                self.controls.new_queue(items, false, start_index);
+                self.controls.play();
+            }
+            QueueEventType::SrvrCtrlQueueCleared => {
+                self.controls.clear_queue();
+            }
+            _ => {}
+        }
+    }
+
+    async fn handle_renderer_command(
+        &mut self,
+        transport: &NativeWsTransport,
+        command: RendererServerCommand,
+    ) {
+        match command.command_type {
+            RendererCommandType::SrvrRndrSetState => {
+                let playing_state = command.payload.get("playing_state").and_then(Value::as_i64);
+
+                match playing_state {
+                    Some(PLAYING_STATE_PLAYING) => self.controls.play(),
+                    Some(PLAYING_STATE_STOPPED) | Some(PLAYING_STATE_PAUSED) => self.controls.pause(),
+                    _ => {}
+                }
+
+                if let Some(position_ms) = command
+                    .payload
+                    .get("current_position")
+                    .and_then(Value::as_u64)
+                {
+                    self.controls.seek(Duration::from_millis(position_ms));
+                }
+
+                if let Some(target_queue_id) = command
+                    .payload
+                    .get("current_track")
+                    .and_then(|t| t.get("queue_item_id"))
+                    .and_then(Value::as_u64)
+                {
+                    let tracklist = self.tracklist_receiver.borrow().clone();
+                    if tracklist.current_queue_id() != Some(target_queue_id) {
+                        let index = tracklist
+                            .queue()
+                            .iter()
+                            .position(|item| item.queue_id == target_queue_id);
+
+                        if let Some(index) = index {
+                            self.controls.skip_to_position(index, true);
+                        }
+                    }
+                }
+
+                self.report_state(transport).await;
+            }
+            RendererCommandType::SrvrRndrSetVolume => {
+                if let Some(volume) = command.payload.get("volume").and_then(Value::as_u64) {
+                    let volume = (volume as f32 / 100.0).clamp(0.0, 1.0);
+                    self.controls.set_volume(volume);
+                }
+
+                self.report_volume(transport).await;
+            }
+            RendererCommandType::SrvrRndrSetActive => {
+                let active = command
+                    .payload
+                    .get("active")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false);
+
+                tracing::info!("Qobuz Connect active renderer: {active}");
+
+                if active {
+                    self.report_state(transport).await;
+                    self.report_volume(transport).await;
+                    self.report_max_quality(transport).await;
+                }
+            }
+            _ => {}
+        }
+    }
+
+    async fn send_controller_join(&self, transport: &NativeWsTransport) -> AppResult<()> {
+        let device_info = device_info_json(
+            &self.connect_name,
+            &self.device_uuid,
+            self.max_audio_quality,
+        );
+
+        let command = QueueCommand::new(
+            QueueCommandType::CtrlSrvrJoinSession,
+            Uuid::new_v4().to_string(),
+            self.queue_version,
+            json!({ "device_info": device_info }),
+        );
+
+        let envelope = build_qconnect_outbound_envelope(command)
+            .map_err(|err| PlayerError::ConnectError { error: err.to_string() })?;
+
+        transport.send(envelope).await.map_err(|err| map_ws_err(&err))?;
+
+        tracing::info!("Qobuz Connect controller joined");
+        Ok(())
+    }
+
+    async fn send_renderer_join(&mut self, transport: &NativeWsTransport, session_uuid: &str) {
+        if self.renderer_joined {
+            return;
+        }
+
+        let device_info = device_info_json(
+            &self.connect_name,
+            &self.device_uuid,
+            self.max_audio_quality,
+        );
+
+        let queue_version = self.queue_version;
+
+        let report = RendererReport::new(
+            RendererReportType::RndrSrvrJoinSession,
+            Uuid::new_v4().to_string(),
+            queue_version,
+            json!({
+                "session_uuid": session_uuid,
+                "device_info": device_info,
+                "is_active": false,
+                "reason": 0,
+                "initial_state": {
+                    "playing_state": PLAYING_STATE_STOPPED,
+                    "buffer_state": BUFFER_STATE_OK,
+                    "current_position": 0,
+                    "duration": 0,
+                    "queue_version": {
+                        "major": queue_version.major,
+                        "minor": queue_version.minor,
+                    },
+                },
+            }),
+        );
+
+        let envelope = match build_qconnect_renderer_outbound_envelope(report) {
+            Ok(envelope) => envelope,
+            Err(err) => {
+                tracing::warn!("Failed to build renderer join: {err}");
+                return;
+            }
+        };
+
+        if let Err(err) = transport.send(envelope).await {
+            tracing::warn!("Failed to send renderer join: {err}");
+            return;
+        }
+
+        self.renderer_joined = true;
+        tracing::info!("Qobuz Connect renderer joined session {session_uuid}");
+
+        self.report_state(transport).await;
+        self.report_volume(transport).await;
+        self.report_max_quality(transport).await;
+    }
+
+    async fn send_report(
+        &self,
+        transport: &NativeWsTransport,
+        report_type: RendererReportType,
+        payload: Value,
+    ) {
+        let report = RendererReport::new(
+            report_type,
+            Uuid::new_v4().to_string(),
+            self.queue_version,
+            payload,
+        );
+
+        let envelope = match build_qconnect_renderer_outbound_envelope(report) {
+            Ok(envelope) => envelope,
+            Err(err) => {
+                tracing::warn!("Failed to build renderer report: {err}");
+                return;
+            }
+        };
+
+        if let Err(err) = transport.send(envelope).await {
+            tracing::warn!("Failed to send renderer report: {err}");
+        }
+    }
+
+    async fn report_state(&self, transport: &NativeWsTransport) {
+        if !self.renderer_joined {
+            return;
+        }
+
+        let position = { *self.position_receiver.borrow() };
+        let status = { *self.status_receiver.borrow() };
+        let tracklist = self.tracklist_receiver.borrow().clone();
+
+        let payload = state_report_payload(status, &position, &tracklist, self.queue_version);
+        self.send_report(transport, RendererReportType::RndrSrvrStateUpdated, payload)
+            .await;
+    }
+
+    async fn report_volume(&self, transport: &NativeWsTransport) {
+        if !self.renderer_joined {
+            return;
+        }
+
+        let volume = convert_volume(*self.volume_receiver.borrow());
+        self.send_report(
+            transport,
+            RendererReportType::RndrSrvrVolumeChanged,
+            json!({ "volume": volume }),
+        )
+        .await;
+    }
+
+    async fn report_max_quality(&self, transport: &NativeWsTransport) {
+        if !self.renderer_joined {
+            return;
+        }
+
+        self.send_report(
+            transport,
+            RendererReportType::RndrSrvrMaxAudioQualityChanged,
+            json!({ "max_audio_quality": self.max_audio_quality }),
+        )
+        .await;
     }
 }

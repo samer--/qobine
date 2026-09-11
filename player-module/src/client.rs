@@ -59,6 +59,16 @@ impl StreamClient {
         Ok(client.app_id().to_string())
     }
 
+    pub async fn create_qws_token(&self) -> AppResult<(String, String)> {
+        let client = self.get_client().await?;
+        client
+            .create_qws_token()
+            .await
+            .map_err(|err| PlayerError::ConnectError {
+                error: err.to_string(),
+            })
+    }
+
     pub async fn new_with_oauth_login(
         max_audio_quality: AudioQuality,
         file_based_streaming: bool,

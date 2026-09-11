@@ -54,6 +54,8 @@ fn main() {
 }
 
 pub async fn run() -> AppResult<()> {
+    tracing_subscriber::fmt().init();
+
     let args = Arguments::parse();
     let database = Arc::new(Database::new().await?);
     let headless = false;
@@ -110,18 +112,19 @@ pub async fn run() -> AppResult<()> {
 
     #[cfg(feature = "connect")]
     if args.connect.connect {
-        let app_id = client.app_id().await?;
         let position_receiver = player.position();
         let tracklist_receiver = player.tracklist();
         let volume_receiver = player.volume();
         let status_receiver = player.status();
         let controls = player.controls();
+        let client = client.clone();
+        let database = database.clone();
 
         tokio::spawn(async move {
             if let Err(err) = connect_module::init(
-                &app_id,
+                client,
+                database,
                 args.connect.name_args.connect_name,
-                args.connect.name_args.connect_port,
                 controls,
                 position_receiver,
                 tracklist_receiver,
