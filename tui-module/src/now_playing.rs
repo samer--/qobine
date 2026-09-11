@@ -19,8 +19,7 @@ pub fn render(frame: &mut Frame, area: Rect, state: &NowPlayingState) {
         return;
     };
 
-    let block = block(Some(get_status(state.status)))
-        .title(Line::from(format_volume(state.volume)).right_aligned());
+    let block = block(Some(get_status(state.status)));
     let inner = block.inner(area);
 
     frame.render_widget(block, area);
@@ -30,7 +29,11 @@ pub fn render(frame: &mut Frame, area: Rect, state: &NowPlayingState) {
         .constraints([Constraint::Min(1), Constraint::Length(1)])
         .areas(inner);
 
-    let mut lines = vec![Line::from(track.title.as_str()).bold()];
+    render_progress(frame, progress_area, state.duration_ms, track);
+
+    let title_line = Line::from(track.title.as_str()).bold();
+
+    let mut lines = Vec::new();
 
     if let Some(artist) = &track.artist_name {
         lines.push(Line::from(artist.as_str()));
@@ -46,8 +49,25 @@ pub fn render(frame: &mut Frame, area: Rect, state: &NowPlayingState) {
         state.tracklist_length,
     )));
 
-    render_progress(frame, progress_area, state.duration_ms, track);
-    frame.render_widget(Text::from(lines), content_area);
+    let volume_text = format_volume(state.volume);
+    let volume_width = u16::try_from(volume_text.chars().count()).unwrap_or_default();
+
+    let [title_area, rest_area] = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Length(1), Constraint::Min(0)])
+        .areas(content_area);
+
+    let [title_line_area, volume_area] = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([
+            Constraint::Min(1),
+            Constraint::Length(volume_width.min(title_area.width)),
+        ])
+        .areas(title_area);
+
+    frame.render_widget(Text::from(vec![title_line]), title_line_area);
+    frame.render_widget(Text::from(lines), rest_area);
+    frame.render_widget(Paragraph::new(volume_text).alignment(Alignment::Right), volume_area);
 }
 
 pub fn render_progress(frame: &mut Frame, area: Rect, duration_ms: u32, track: &Track) {
@@ -89,7 +109,7 @@ pub const fn get_status(state: Status) -> &'static str {
 
 fn format_volume(volume: f32) -> String {
     let percentage = (volume * 100.0).to_u32().unwrap_or_default();
-    format!("Vol {percentage}%")
+    format!("{percentage}%")
 }
 
 fn smooth_gauge(ratio: f64, width: u16) -> String {
