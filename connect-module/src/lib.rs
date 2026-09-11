@@ -44,6 +44,8 @@ struct ConnectState {
     device_uuid: String,
     session_uuid: Option<String>,
     renderer_joined: bool,
+    is_active: bool,
+    last_pushed_queue: Option<Vec<u32>>,
 }
 
 pub async fn init(
@@ -73,6 +75,8 @@ pub async fn init(
         device_uuid,
         session_uuid: None,
         renderer_joined: false,
+        is_active: false,
+        last_pushed_queue: None,
     };
 
     state.run(&endpoint, &jwt).await
@@ -213,6 +217,7 @@ impl ConnectState {
                     self.report_state(&transport).await;
                 }
                 Ok(()) = self.tracklist_receiver.changed() => {
+                    self.publish_local_queue_if_changed(&transport).await;
                     self.report_state(&transport).await;
                 }
                 Ok(()) = self.status_receiver.changed() => {
@@ -273,17 +278,24 @@ impl ConnectState {
             }
             QueueEventType::SrvrCtrlQueueState => {
                 let items = parse_queue_items(&event.payload, "tracks");
+                let incoming_ids: Vec<u32> = items.iter().map(|item| item.track_id).collect();
+                self.last_pushed_queue = Some(incoming_ids);
                 self.controls.new_queue(items, false, None);
             }
             QueueEventType::SrvrCtrlQueueTracksLoaded => {
                 let items = parse_queue_items(&event.payload, "tracks");
+                let incoming_ids: Vec<u32> = items.iter().map(|item| item.track_id).collect();
+                let is_echo = self.last_pushed_queue.as_deref() == Some(incoming_ids.as_slice());
+                self.last_pushed_queue = Some(incoming_ids);
                 let start_index = event
                     .payload
                     .get("queue_position")
                     .and_then(Value::as_u64)
                     .and_then(|x| usize::try_from(x).ok());
                 self.controls.new_queue(items, false, start_index);
-                self.controls.play();
+                if !is_echo {
+                    self.controls.play();
+                }
             }
             QueueEventType::SrvrCtrlQueueCleared => {
                 self.controls.clear_queue();
@@ -352,8 +364,10 @@ impl ConnectState {
                     .unwrap_or(false);
 
                 tracing::info!("Qobuz Connect active renderer: {active}");
+                self.is_active = active;
 
                 if active {
+                    self.publish_local_queue_if_changed(transport).await;
                     self.report_state(transport).await;
                     self.report_volume(transport).await;
                     self.report_max_quality(transport).await;
@@ -361,6 +375,57 @@ impl ConnectState {
             }
             _ => {}
         }
+    }
+
+    async fn publish_local_queue_if_changed(&mut self, transport: &NativeWsTransport) {
+        if !self.renderer_joined || !self.is_active {
+            return;
+        }
+
+        let tracklist = self.tracklist_receiver.borrow().clone();
+        let track_ids: Vec<u32> = tracklist.queue().iter().map(|item| item.track.id).collect();
+
+        if track_ids.is_empty() {
+            return;
+        }
+
+        if self.last_pushed_queue.as_deref() == Some(track_ids.as_slice()) {
+            return;
+        }
+
+        let start_index = tracklist.current_position();
+
+        let command = QueueCommand::new(
+            QueueCommandType::CtrlSrvrQueueLoadTracks,
+            Uuid::new_v4().to_string(),
+            self.queue_version,
+            json!({
+                "track_ids": track_ids,
+                "queue_position": start_index,
+                "shuffle_mode": false,
+                "shuffle_pivot_index": start_index,
+                "context_uuid": Uuid::new_v4().to_string(),
+                "autoplay_reset": true,
+                "autoplay_loading": false,
+            }),
+        );
+
+        let envelope = match build_qconnect_outbound_envelope(command) {
+            Ok(envelope) => envelope,
+            Err(err) => {
+                tracing::warn!("Failed to build queue publish: {err}");
+                return;
+            }
+        };
+
+        let count = track_ids.len();
+        if let Err(err) = transport.send(envelope).await {
+            tracing::warn!("Failed to publish queue: {err}");
+            return;
+        }
+
+        self.last_pushed_queue = Some(track_ids);
+        tracing::info!("Published local queue to Qobuz Connect ({count} tracks)");
     }
 
     async fn send_controller_join(&self, transport: &NativeWsTransport) -> AppResult<()> {
