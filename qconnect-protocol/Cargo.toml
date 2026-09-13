@@ -1,0 +1,21 @@
+[lints]
+workspace = true
+
+[package]
+name = "qconnect-protocol"
+version.workspace = true
+edition.workspace = true
+license-file.workspace = true
+repository.workspace = true
+description = "Qobuz Connect protocol contracts for queue commands and events"
+
+[dependencies]
+serde.workspace = true
+serde_json.workspace = true
+thiserror = "2"
+tracing.workspace = true
+prost = "0.13"
+uuid = { version = "1", features = ["v4"] }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["test-util"] }

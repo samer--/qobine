@@ -13,7 +13,9 @@ members = [
   "disconnect-server-module",
   "disconnect-module",
   "player-module",
-  "macos-module"
+  "macos-module",
+  "qconnect-protocol",
+  "qconnect-transport-ws"
 ]
 resolver = "2"
 
