@@ -1,0 +1,39 @@
+FROM rust:1-trixie as build
+
+ENV CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER=aarch64-linux-gnu-gcc \
+    AR_aarch64_unknown_linux_gnu=aarch64-linux-gnu-ar \
+    CC_aarch64_unknown_linux_gnu=aarch64-linux-gnu-gcc \
+    CXX_aarch64_unknown_linux_gnu=aarch64-linux-gnu-g++ 
+
+ENV PKG_CONFIG_ALLOW_CROSS=1
+ENV PKG_CONFIG_PATH="/usr/lib/aarch64-linux-gnu/pkgconfig/:${PKG_CONFIG_PATH}"
+
+
+RUN dpkg --add-architecture arm64
+RUN apt-get update && DEBIAN_FRONTEND=noninteractive apt-get -qq install just g++-aarch64-linux-gnu libc6-dev-arm64-cross libglib2.0-dev:arm64 
+
+WORKDIR /app
+RUN rustup target add aarch64-unknown-linux-gnu
+RUN rustup toolchain install --force-non-host stable-aarch64-unknown-linux-gnu
+
+RUN cargo install sqlx-cli
+
+RUN DEBIAN_FRONTEND=noninteractive apt-get -qq install libssl-dev:arm64 libasound2-dev:arm64 # curl nodejs npm
+# ENV DATABASE_URL="sqlite:///tmp/data.db"
+
+COPY . .
+
+ENV targ=aarch64-unknown-linux-gnu
+RUN just create-env-file && just init-database
+RUN cargo build -j 6 -p tui-module --release --features connect --target=$targ
+RUN cargo build -j 6 -p connect-module --release --target=$targ
+RUN cargo build -j 6 -p web-module --release --features connect --target=$targ
+# RUN just build-www
+
+# RUN mv target/aarch64-unknown-linux-gnu/release/qobine-{tui,web,connect} /usr/local/bin
+
+# FROM scratch
+
+# COPY --from=build /usr/local/bin/qobine-web .
+# COPY --from=build /usr/local/bin/qobine-tui .
+# COPY --from=build /usr/local/bin/qobine-connect .
