@@ -20,3 +20,9 @@ build-all:
     just build-styles
     just build-assets
     cargo build --release
+
+docker-build-aarch64 arch=arch():
+  docker build -f Dockerfile.aarch64 -t qobine .
+  docker cp $(docker create qobine:latest):qobine-connect .
+  docker cp $(docker create qobine:latest):qobine-tui .
+  docker cp $(docker create qobine:latest):qobine-web .
