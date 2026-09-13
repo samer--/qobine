@@ -21,8 +21,9 @@ build-all:
     just build-assets
     cargo build --release
 
-docker-build-aarch64 arch=arch():
+docker-build-aarch64:
   docker build -f Dockerfile.aarch64 -t qobine .
-  docker cp $(docker create qobine:latest):qobine-connect .
-  docker cp $(docker create qobine:latest):qobine-tui .
-  docker cp $(docker create qobine:latest):qobine-web .
+  mkdir -p target/aarch64
+  docker cp $(docker create qobine:latest):/app/qobine-connect target/aarch64
+  docker cp $(docker create qobine:latest):/app/qobine-tui target/aarch64
+  docker cp $(docker create qobine:latest):/app/qobine-web target/aarch64

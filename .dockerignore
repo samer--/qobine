@@ -1,2 +1,6 @@
 target
 Dockerfile.*
+old
+todo.txt
+.env
+

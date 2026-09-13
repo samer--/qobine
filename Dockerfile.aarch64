@@ -19,21 +19,34 @@ RUN rustup toolchain install --force-non-host stable-aarch64-unknown-linux-gnu
 RUN cargo install sqlx-cli
 
 RUN DEBIAN_FRONTEND=noninteractive apt-get -qq install libssl-dev:arm64 libasound2-dev:arm64 # curl nodejs npm
-# ENV DATABASE_URL="sqlite:///tmp/data.db"
 
-COPY . .
+COPY macos-module macos-module
+COPY gtk-module gtk-module
+COPY disconnect-module disconnect-module
+COPY disconnect-server-module disconnect-server-module
+COPY mpris-module mpris-module
+COPY rfid-module rfid-module
+COPY controls-module controls-module
+COPY cli-module cli-module
+COPY gpio-module gpio-module
+COPY qobuz-client qobuz-client
+COPY qconnect-protocol qconnect-protocol
+COPY qconnect-transport-ws  qconnect-transport-ws
+COPY player-module player-module
+COPY connect-module connect-module
+COPY tui-module tui-module
+COPY web-module web-module
+COPY justfile ./
+COPY Cargo.toml ./
+# COPY Cargo.lock ./
+# COPY cargo-sources.json ./
+# COPY codebook.toml ./
 
 ENV targ=aarch64-unknown-linux-gnu
 RUN just create-env-file && just init-database
-RUN cargo build -j 6 -p tui-module --release --features connect --target=$targ
-RUN cargo build -j 6 -p connect-module --release --target=$targ
-RUN cargo build -j 6 -p web-module --release --features connect --target=$targ
-# RUN just build-www
 
-# RUN mv target/aarch64-unknown-linux-gnu/release/qobine-{tui,web,connect} /usr/local/bin
+RUN cargo build -j 6 -p connect-module -p tui-module -p web-module --release --features connect --target=$targ
 
-# FROM scratch
-
-# COPY --from=build /usr/local/bin/qobine-web .
-# COPY --from=build /usr/local/bin/qobine-tui .
-# COPY --from=build /usr/local/bin/qobine-connect .
+RUN mv target/aarch64-unknown-linux-gnu/release/qobine-web . 
+RUN mv target/aarch64-unknown-linux-gnu/release/qobine-tui . 
+RUN mv target/aarch64-unknown-linux-gnu/release/qobine-connect . 
