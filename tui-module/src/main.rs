@@ -104,6 +104,7 @@ pub async fn run() -> AppResult<()> {
     let position_receiver = player.position();
     let tracklist_receiver = player.tracklist();
     let status_receiver = player.status();
+    let volume_receiver = player.volume();
     let controls = player.controls();
     let client = client.clone();
     let broadcast = broadcast.clone();
@@ -180,6 +181,7 @@ pub async fn run() -> AppResult<()> {
             position_receiver,
             tracklist_receiver,
             status_receiver,
+            volume_receiver,
             exit_sender.clone(),
             ttl_tx,
             database,
