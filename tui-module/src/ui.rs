@@ -12,7 +12,6 @@ use tui_input::Input;
 
 use crate::{
     app::{App, AppState, Tab},
-    image_cache::ImageManager,
     now_playing::{self, NowPlayingState},
     widgets::focus,
 };
@@ -22,40 +21,20 @@ pub const HIGHLIGHT_TEXT_STYLE: Style = Style::new().blue();
 pub const SELECTED_STYLE: Style = Style::new().fg(Color::Cyan);
 pub const COLUMN_SPACING: u16 = 2;
 
-pub const ALBUM_COVER_WIDTH: u16 = 20;
-pub const ALBUM_COVER_HEIGHT: u16 = 9;
-pub const ALBUM_COVER_GAP: u16 = 2;
-
-pub const fn album_cover_area(area: Rect) -> Option<Rect> {
-    if area.width < ALBUM_COVER_WIDTH || area.height < ALBUM_COVER_HEIGHT {
-        return None;
-    }
-
-    Some(Rect::new(
-        area.x,
-        area.y,
-        ALBUM_COVER_WIDTH,
-        ALBUM_COVER_HEIGHT,
-    ))
-}
-
 impl App {
     pub fn render(&mut self, frame: &mut Frame) {
         match &mut self.state {
             AppState::Normal => {
-                let tab_area =
-                    render_now_playing_bar(frame, &self.now_playing, &mut self.image_cache);
+                let tab_area = render_now_playing_bar(frame, &self.now_playing);
                 self.render_inner(frame, tab_area);
             }
             AppState::Help => {
-                let tab_area =
-                    render_now_playing_bar(frame, &self.now_playing, &mut self.image_cache);
+                let tab_area = render_now_playing_bar(frame, &self.now_playing);
                 self.render_inner(frame, tab_area);
                 render_help(frame, tab_area);
             }
             AppState::ConnectOverlay(selected) => {
-                let tab_area =
-                    render_now_playing_bar(frame, &self.now_playing, &mut self.image_cache);
+                let tab_area = render_now_playing_bar(frame, &self.now_playing);
                 let available_devices: Vec<String> =
                     self.connect_available_devices.borrow().to_vec();
                 let active_device: String = self.connect_active_device.borrow().to_string();
@@ -68,12 +47,11 @@ impl App {
                 );
             }
             AppState::Focus => {
-                focus::render(frame, &self.now_playing, &mut self.image_cache);
+                focus::render(frame, &self.now_playing);
             }
             AppState::Overlay(popups) => {
                 let favorite_ids = &self.favorite_ids;
-                let tab_area =
-                    render_now_playing_bar(frame, &self.now_playing, &mut self.image_cache);
+                let tab_area = render_now_playing_bar(frame, &self.now_playing);
                 let breadcrumb_titles: Vec<String> = popups
                     .iter()
                     .rev()
@@ -83,13 +61,7 @@ impl App {
                     .collect();
 
                 if let Some(popup) = popups.last_mut() {
-                    popup.render(
-                        frame,
-                        tab_area,
-                        favorite_ids,
-                        &mut self.image_cache,
-                        &breadcrumb_titles,
-                    );
+                    popup.render(frame, tab_area, favorite_ids, &breadcrumb_titles);
                 }
             }
         }
@@ -125,21 +97,16 @@ impl App {
         let favorite_ids = &self.favorite_ids;
 
         match self.current_screen {
-            Tab::Favorites => self
-                .favorites
-                .render(frame, tab_content_area, &mut self.image_cache),
+            Tab::Favorites => self.favorites.render(frame, tab_content_area),
             Tab::Search => {
-                self.search
-                    .render(frame, tab_content_area, favorite_ids, &mut self.image_cache);
+                self.search.render(frame, tab_content_area, favorite_ids);
             }
             Tab::Queue => self.queue.render(frame, tab_content_area, favorite_ids),
             Tab::Discover => {
-                self.discover
-                    .render(frame, tab_content_area, favorite_ids, &mut self.image_cache);
+                self.discover.render(frame, tab_content_area, favorite_ids);
             }
             Tab::Genres => {
-                self.genres
-                    .render(frame, tab_content_area, favorite_ids, &mut self.image_cache);
+                self.genres.render(frame, tab_content_area, favorite_ids);
             }
             Tab::Preferences => self.preferences.render(frame, tab_content_area),
         }
@@ -205,11 +172,7 @@ pub fn center(area: Rect, horizontal: Constraint, vertical: Constraint) -> Rect 
     area
 }
 
-fn render_now_playing_bar(
-    frame: &mut Frame,
-    now_playing: &NowPlayingState,
-    image_cache: &mut ImageManager,
-) -> Rect {
+fn render_now_playing_bar(frame: &mut Frame, now_playing: &NowPlayingState) -> Rect {
     let area = frame.area();
 
     let [content_area, now_playing_area] = Layout::default()
@@ -218,7 +181,7 @@ fn render_now_playing_bar(
         .areas(area);
 
     if now_playing.playing_track.is_some() {
-        now_playing::render(frame, now_playing_area, now_playing, image_cache);
+        now_playing::render(frame, now_playing_area, now_playing);
     }
 
     if now_playing.playing_track.is_some() {

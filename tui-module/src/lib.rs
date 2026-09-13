@@ -12,13 +12,11 @@ use player_module::{
 };
 use queue::QueueState;
 use ratatui::{prelude::*, widgets::Paragraph};
-use ratatui_image::picker::Picker;
 use tokio::sync::{mpsc, watch};
 use ui::center;
 
 use crate::{
     app::{AppState, NotificationList, Tab, build_favorite_ids},
-    image_cache::{ImageLoaded, ImageManager},
     search::SearchState,
 };
 
@@ -27,7 +25,6 @@ mod detail_pages;
 mod discover;
 mod favorites;
 mod genres;
-mod image_cache;
 mod now_playing;
 mod preferences;
 mod queue;
@@ -53,8 +50,6 @@ pub async fn init(
 ) -> AppResult<()> {
     let mut terminal = ratatui::init();
 
-    let picker = Picker::from_query_stdio().unwrap_or_else(|_| Picker::halfblocks());
-
     draw_loading_screen(&mut terminal)?;
 
     let tracklist_value = tracklist_receiver.borrow().clone();
@@ -69,9 +64,6 @@ pub async fn init(
     let initial_configuration = database.get_configuration().await?;
     let favorites = FavoritesState::new(&client).await?;
     let favorite_ids = build_favorite_ids(&favorites);
-
-    let (image_tx, image_rx) = mpsc::unbounded_channel::<ImageLoaded>();
-    let image_cache = ImageManager::new(picker, image_tx);
 
     let mut app = App {
         broadcast,
@@ -99,8 +91,6 @@ pub async fn init(
             initial_configuration,
         ),
         client,
-        image_cache,
-        image_rx,
         connect_available_devices,
         connect_active_device,
         set_connect_active_device,

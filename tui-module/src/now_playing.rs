@@ -1,14 +1,7 @@
-use crate::{
-    image_cache::{AppImage, ImageManager},
-    ui::{
-        ALBUM_COVER_GAP, ALBUM_COVER_HEIGHT, ALBUM_COVER_WIDTH, HIGHLIGHT_TEXT_STYLE,
-        album_cover_area, block, format_mseconds, format_seconds,
-    },
-};
+use crate::ui::{HIGHLIGHT_TEXT_STYLE, block, format_mseconds, format_seconds};
 use controls_module::{Status, models::Track};
 use num_traits::ToPrimitive;
 use ratatui::{prelude::*, widgets::Paragraph};
-use ratatui_image::StatefulImage;
 
 #[derive(Default)]
 pub struct NowPlayingState {
@@ -20,12 +13,7 @@ pub struct NowPlayingState {
     pub duration_ms: u32,
 }
 
-pub fn render(
-    frame: &mut Frame,
-    area: Rect,
-    state: &NowPlayingState,
-    image_cache: &mut ImageManager,
-) {
+pub fn render(frame: &mut Frame, area: Rect, state: &NowPlayingState) {
     let Some(track) = &state.playing_track else {
         return;
     };
@@ -35,43 +23,10 @@ pub fn render(
 
     frame.render_widget(block, area);
 
-    let image = track
-        .image
-        .as_ref()
-        .and_then(|key| image_cache.get_mut(key));
-
-    let can_render_cover = image.is_some()
-        && inner.height >= ALBUM_COVER_HEIGHT
-        && inner.width
-            >= ALBUM_COVER_WIDTH
-                .saturating_add(ALBUM_COVER_GAP)
-                .saturating_add(1);
-
-    let info_area = if can_render_cover {
-        let [image_area, _gap, content_area] = Layout::default()
-            .direction(Direction::Horizontal)
-            .constraints([
-                Constraint::Length(ALBUM_COVER_WIDTH),
-                Constraint::Length(ALBUM_COVER_GAP),
-                Constraint::Min(1),
-            ])
-            .areas(inner);
-
-        if let Some(image_area) = album_cover_area(image_area)
-            && let Some(AppImage { protocol, .. }) = image
-        {
-            frame.render_stateful_widget(StatefulImage::default(), image_area, protocol);
-        }
-
-        content_area
-    } else {
-        inner
-    };
-
     let [content_area, progress_area] = Layout::default()
         .direction(Direction::Vertical)
         .constraints([Constraint::Min(1), Constraint::Length(1)])
-        .areas(info_area);
+        .areas(inner);
 
     let mut lines = vec![Line::from(track.title.as_str()).bold()];
 

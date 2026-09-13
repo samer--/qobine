@@ -5,13 +5,11 @@ use ratatui::{
     prelude::*,
     widgets::{ListState, Paragraph},
 };
-use ratatui_image::StatefulImage;
 
 use super::{AlbumOverlay, ArtistOverlay, Overlay};
 use crate::{
     app::Output,
-    image_cache::{AppImage, ImageManager},
-    ui::{ALBUM_COVER_GAP, ALBUM_COVER_HEIGHT, ALBUM_COVER_WIDTH, block, format_seconds, sidebar},
+    ui::{block, format_seconds, sidebar},
 };
 
 pub struct TrackInfoOverlay {
@@ -38,8 +36,8 @@ impl TrackInfoOverlay {
         &self.track.title
     }
 
-    pub fn render(&mut self, frame: &mut Frame, area: Rect, image_cache: &mut ImageManager) {
-        let header_height = ALBUM_COVER_HEIGHT + 1;
+    pub fn render(&mut self, frame: &mut Frame, area: Rect) {
+        let header_height = 4;
         let outer_block = block(Some("Track Info"));
 
         frame.render_widget(&outer_block, area);
@@ -49,7 +47,7 @@ impl TrackInfoOverlay {
         let [header_area, body_area] =
             Layout::vertical([Constraint::Length(header_height), Constraint::Min(1)]).areas(inner);
 
-        self.render_header(frame, header_area, image_cache);
+        self.render_header(frame, header_area);
         self.render_body(frame, body_area);
     }
 
@@ -87,36 +85,7 @@ impl TrackInfoOverlay {
         }
     }
 
-    fn render_header(&mut self, frame: &mut Frame, area: Rect, image_cache: &mut ImageManager) {
-        let image = self
-            .track
-            .image
-            .as_ref()
-            .and_then(|url| image_cache.get_mut(url));
-
-        let can_render_cover = image.is_some()
-            && area.width >= ALBUM_COVER_WIDTH.saturating_add(ALBUM_COVER_GAP)
-            && area.height >= ALBUM_COVER_HEIGHT;
-
-        let image_width = if can_render_cover {
-            ALBUM_COVER_WIDTH
-        } else {
-            0
-        };
-
-        let gap = if can_render_cover { ALBUM_COVER_GAP } else { 0 };
-
-        let [image_area, _, info_area] = Layout::horizontal([
-            Constraint::Length(image_width),
-            Constraint::Length(gap),
-            Constraint::Min(1),
-        ])
-        .areas(area);
-
-        if can_render_cover && let Some(AppImage { protocol, .. }) = image {
-            frame.render_stateful_widget(StatefulImage::default(), image_area, protocol);
-        }
-
+    fn render_header(&mut self, frame: &mut Frame, area: Rect) {
         let title = Line::from(Span::styled(self.track.title.clone(), Style::new().bold()));
 
         let artist_name = self
@@ -140,7 +109,7 @@ impl TrackInfoOverlay {
             metadata,
         ];
 
-        frame.render_widget(Paragraph::new(header_lines), info_area);
+        frame.render_widget(Paragraph::new(header_lines), area);
     }
 
     fn render_body(&self, frame: &mut Frame, area: Rect) {

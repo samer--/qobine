@@ -9,7 +9,6 @@ use ratatui::{
     prelude::*,
     widgets::{ListState, Paragraph, ScrollbarState},
 };
-use ratatui_image::StatefulImage;
 
 use super::{
     ArtistOverlay, Overlay, OverlayFocus, about_scroll_delta, header_blurb, render_about,
@@ -17,11 +16,7 @@ use super::{
 };
 use crate::{
     app::{FavoriteIds, NotificationList, Output},
-    image_cache::{AppImage, ImageManager},
-    ui::{
-        ALBUM_COVER_GAP, ALBUM_COVER_HEIGHT, ALBUM_COVER_WIDTH, block, format_seconds,
-        mark_as_favorite, sidebar,
-    },
+    ui::{block, format_seconds, mark_as_favorite, sidebar},
     widgets::{
         grid::Grid,
         track_list::{TrackList, TrackListEvent},
@@ -35,7 +30,6 @@ pub struct AlbumOverlay {
     tracks: TrackList,
     similar: Grid<AlbumSimple>,
     description: Option<String>,
-    image_url: String,
     release_year: u32,
     total_tracks: u32,
     duration_seconds: u32,
@@ -73,7 +67,6 @@ impl AlbumOverlay {
             tracks: TrackList::new(album.tracks),
             similar: Grid::new(similar),
             description: album.description,
-            image_url: album.image,
             release_year: album.release_year,
             total_tracks: album.total_tracks,
             duration_seconds: album.duration_seconds,
@@ -92,14 +85,8 @@ impl AlbumOverlay {
         &self.title
     }
 
-    pub fn render(
-        &mut self,
-        frame: &mut Frame,
-        area: Rect,
-        favorites: &FavoriteIds,
-        image_cache: &mut ImageManager,
-    ) {
-        let header_height = ALBUM_COVER_HEIGHT + 1;
+    pub fn render(&mut self, frame: &mut Frame, area: Rect, favorites: &FavoriteIds) {
+        let header_height = 5;
         let outer_block = block(Some(&self.title));
 
         frame.render_widget(&outer_block, area);
@@ -108,8 +95,8 @@ impl AlbumOverlay {
         let [header_area, body_area] =
             Layout::vertical([Constraint::Length(header_height), Constraint::Min(1)]).areas(inner);
 
-        self.render_header(frame, header_area, favorites, image_cache);
-        self.render_body(frame, body_area, favorites, image_cache);
+        self.render_header(frame, header_area, favorites);
+        self.render_body(frame, body_area, favorites);
     }
 
     pub async fn handle_event(
@@ -129,38 +116,7 @@ impl AlbumOverlay {
         }
     }
 
-    fn render_header(
-        &mut self,
-        frame: &mut Frame,
-        area: Rect,
-        favorites: &FavoriteIds,
-        image_cache: &mut ImageManager,
-    ) {
-        let can_render_cover = image_cache.get_mut(&self.image_url).is_some()
-            && area.width >= ALBUM_COVER_WIDTH.saturating_add(2)
-            && area.height >= ALBUM_COVER_HEIGHT;
-
-        let image_width = if can_render_cover {
-            ALBUM_COVER_WIDTH
-        } else {
-            0
-        };
-
-        let gap = if can_render_cover { ALBUM_COVER_GAP } else { 0 };
-
-        let [image_area, _, info_area] = Layout::horizontal([
-            Constraint::Length(image_width),
-            Constraint::Length(gap),
-            Constraint::Min(1),
-        ])
-        .areas(area);
-
-        if can_render_cover
-            && let Some(AppImage { protocol, .. }) = image_cache.get_mut(&self.image_url)
-        {
-            frame.render_stateful_widget(StatefulImage::default(), image_area, protocol);
-        }
-
+    fn render_header(&mut self, frame: &mut Frame, area: Rect, favorites: &FavoriteIds) {
         let [title, artist, metadata] = self.album_detail_lines(
             favorites.albums().contains(&self.id),
             favorites.artists().contains(&self.artist.id),
@@ -179,7 +135,7 @@ impl AlbumOverlay {
                 Constraint::Length(1),
                 Constraint::Min(0),
             ])
-            .areas(info_area);
+            .areas(area);
 
             frame.render_widget(Paragraph::new(title), title_area);
             frame.render_widget(Paragraph::new(artist), artist_area);
@@ -203,7 +159,7 @@ impl AlbumOverlay {
                 Constraint::Length(1),
                 Constraint::Min(0),
             ])
-            .areas(info_area);
+            .areas(area);
 
             frame.render_widget(Paragraph::new(title), title_area);
             frame.render_widget(Paragraph::new(artist), artist_area);
@@ -211,13 +167,7 @@ impl AlbumOverlay {
         }
     }
 
-    fn render_body(
-        &mut self,
-        frame: &mut Frame,
-        area: Rect,
-        favorites: &FavoriteIds,
-        image_cache: &mut ImageManager,
-    ) {
+    fn render_body(&mut self, frame: &mut Frame, area: Rect, favorites: &FavoriteIds) {
         let (sidebar_widget, sidebar_width) =
             sidebar(self.tabs(), self.focus == OverlayFocus::Sidebar);
 
@@ -265,7 +215,6 @@ impl AlbumOverlay {
                                 frame.buffer_mut(),
                                 true,
                                 favorites.albums(),
-                                image_cache,
                             );
                         }
                     }

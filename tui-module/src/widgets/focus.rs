@@ -1,79 +1,21 @@
 use crate::{
-    image_cache::ImageManager,
     now_playing::{NowPlayingState, get_status, render_progress},
     ui::{HIGHLIGHT_TEXT_STYLE, center},
 };
 use num_traits::ToPrimitive;
-use ratatui::{layout::Flex, prelude::*, widgets::Paragraph};
-use ratatui_image::{FilterType, Resize, StatefulImage};
+use ratatui::{prelude::*, widgets::Paragraph};
 use tui_big_text::{BigText, PixelSize};
 
-const IMAGE_INFO_GAP: u16 = 6;
 const CHAR_WIDTH: u16 = 4;
 const CHAR_HEIGHT: u16 = 2;
 
-pub fn render(frame: &mut Frame, state: &NowPlayingState, image_cache: &mut ImageManager) {
+pub fn render(frame: &mut Frame, state: &NowPlayingState) {
     let area = frame.area();
     let Some(track) = &state.playing_track else {
         return;
     };
 
-    let image = track.image.as_ref().and_then(|x| image_cache.get_mut(x));
-
-    let image_size = image.as_deref().map(|image| {
-        image.protocol.size_for(
-            Resize::Scale(Some(FilterType::Triangle)),
-            Size::new(
-                area.width
-                    .saturating_mul(2)
-                    .checked_div(5)
-                    .unwrap_or_default(),
-                area.height
-                    .saturating_mul(9)
-                    .checked_div(10)
-                    .unwrap_or_default(),
-            ),
-        )
-    });
-
-    let info_area = match image_size {
-        Some(size) => {
-            let info_width = size.width.max(50).min(
-                area.width
-                    .saturating_sub(size.width.saturating_add(IMAGE_INFO_GAP)),
-            );
-
-            let [image_area, info_area] = Layout::horizontal([
-                Constraint::Length(size.width),
-                Constraint::Length(info_width),
-            ])
-            .spacing(IMAGE_INFO_GAP)
-            .flex(Flex::Center)
-            .areas(area);
-
-            let image_area = center(
-                image_area,
-                Constraint::Length(size.width),
-                Constraint::Length(size.height),
-            );
-
-            if let Some(image) = image {
-                frame.render_stateful_widget(
-                    StatefulImage::new().resize(Resize::Scale(Some(FilterType::Triangle))),
-                    image_area,
-                    &mut image.protocol,
-                );
-            }
-
-            Rect {
-                x: info_area.x,
-                y: image_area.y.saturating_add(1),
-                width: info_area.width,
-                height: image_area.height.saturating_sub(2),
-            }
-        }
-        None => center(area, Constraint::Percentage(60), Constraint::Percentage(80)),
-    };
+    let info_area = center(area, Constraint::Percentage(60), Constraint::Percentage(80));
 
     let entity_lines = state
         .entity_title

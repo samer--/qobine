@@ -17,7 +17,6 @@ use ratatui::{
         StatefulWidget, Widget,
     },
 };
-use ratatui_image::StatefulImage;
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use crate::{
@@ -26,10 +25,9 @@ use crate::{
         AlbumOverlay, ArtistOverlay, DeletePlaylistOverlay, NewPlaylistOverlay, Overlay,
         PlaylistOverlay,
     },
-    image_cache::ImageManager,
     ui::{
-        ALBUM_COVER_HEIGHT, ALBUM_COVER_WIDTH, HIGHLIGHT_TEXT_STYLE, SELECTED_STYLE,
-        album_cover_area, format_duration, mark_as_favorite, mark_as_owned, mark_explicit_and_hifi,
+        HIGHLIGHT_TEXT_STYLE, SELECTED_STYLE, format_duration, mark_as_favorite, mark_as_owned,
+        mark_explicit_and_hifi,
     },
     widgets::filtered_list::FilteredListState,
 };
@@ -52,7 +50,6 @@ pub trait GridItem {
         buf: &mut Buffer,
         style: Style,
         favorites: &HashSet<Self::Id>,
-        image_cache: &mut ImageManager,
     );
 
     async fn on_key_event(&self, key: KeyCode, context: GridEventContext<'_>) -> AppResult<Output>;
@@ -89,7 +86,6 @@ where
         buf: &mut Buffer,
         focus: bool,
         favorites: &HashSet<T::Id>,
-        image_cache: &mut ImageManager,
     ) {
         if area.width < T::CARD_WIDTH || area.height < T::CARD_HEIGHT {
             return;
@@ -184,7 +180,7 @@ where
                 _ => Style::default(),
             };
 
-            item.render_card(this_card_area, buf, style, favorites, image_cache);
+            item.render_card(this_card_area, buf, style, favorites);
         }
 
         if show_scrollbar {
@@ -329,8 +325,8 @@ where
 
 impl GridItem for AlbumSimple {
     type Id = String;
-    const CARD_WIDTH: u16 = ALBUM_COVER_WIDTH + 2;
-    const CARD_HEIGHT: u16 = ALBUM_COVER_HEIGHT + 5;
+    const CARD_WIDTH: u16 = 40;
+    const CARD_HEIGHT: u16 = 5;
 
     fn render_card(
         &self,
@@ -338,7 +334,6 @@ impl GridItem for AlbumSimple {
         buf: &mut Buffer,
         style: Style,
         favorites: &HashSet<Self::Id>,
-        image_cache: &mut ImageManager,
     ) {
         Block::default()
             .borders(Borders::ALL)
@@ -351,23 +346,6 @@ impl GridItem for AlbumSimple {
             area.y.saturating_add(1),
             area.width.saturating_sub(2),
             area.height.saturating_sub(2),
-        );
-
-        let Some(image_area) = album_cover_area(inner) else {
-            return;
-        };
-
-        if let Some(image) = image_cache.get_mut(&self.image) {
-            StatefulImage::default().render(image_area, buf, &mut image.protocol);
-        } else {
-            Paragraph::new("Loading...").render(image_area, buf);
-        }
-
-        let text_area = Rect::new(
-            inner.x,
-            image_area.bottom(),
-            inner.width,
-            inner.bottom().saturating_sub(image_area.bottom()),
         );
 
         let is_favorite = favorites.contains(&self.id);
@@ -383,7 +361,7 @@ impl GridItem for AlbumSimple {
 
         let marker_width = marked_title.width().saturating_sub(original_width);
 
-        let available_width = usize::from(text_area.width).saturating_sub(marker_width);
+        let available_width = usize::from(inner.width).saturating_sub(marker_width);
 
         let title = mark_explicit_and_hifi(
             truncate_to_width(&self.title, available_width),
@@ -392,14 +370,14 @@ impl GridItem for AlbumSimple {
             is_favorite,
         );
 
-        let artist = truncate_to_width(&self.artist.name, usize::from(text_area.width));
+        let artist = truncate_to_width(&self.artist.name, usize::from(inner.width));
 
         Paragraph::new(Text::from(vec![
             title.patch_style(style.add_modifier(Modifier::BOLD)),
             Line::from(artist),
             Line::from(self.release_year.to_string()).style(Style::default().italic()),
         ]))
-        .render(text_area, buf);
+        .render(inner, buf);
     }
 
     async fn on_key_event(&self, key: KeyCode, context: GridEventContext<'_>) -> AppResult<Output> {
@@ -455,8 +433,8 @@ impl GridItem for AlbumSimple {
 
 impl GridItem for Artist {
     type Id = u32;
-    const CARD_WIDTH: u16 = ALBUM_COVER_WIDTH + 2;
-    const CARD_HEIGHT: u16 = ALBUM_COVER_HEIGHT + 3;
+    const CARD_WIDTH: u16 = 40;
+    const CARD_HEIGHT: u16 = 3;
 
     fn render_card(
         &self,
@@ -464,7 +442,6 @@ impl GridItem for Artist {
         buf: &mut Buffer,
         style: Style,
         favorites: &HashSet<Self::Id>,
-        image_cache: &mut ImageManager,
     ) {
         Block::default()
             .borders(Borders::ALL)
@@ -479,39 +456,18 @@ impl GridItem for Artist {
             area.height.saturating_sub(2),
         );
 
-        let Some(image_area) = album_cover_area(inner) else {
-            return;
-        };
-
-        if let Some(image_key) = &self.image {
-            if let Some(image) = image_cache.get_mut(image_key) {
-                StatefulImage::default().render(image_area, buf, &mut image.protocol);
-            } else {
-                Paragraph::new("Loading...").render(image_area, buf);
-            }
-        } else {
-            Paragraph::new("No image").render(image_area, buf);
-        }
-
-        let text_area = Rect::new(
-            inner.x,
-            image_area.bottom(),
-            inner.width,
-            inner.bottom().saturating_sub(image_area.bottom()),
-        );
-
         let is_favorite = favorites.contains(&self.id);
 
         let marker_width = mark_as_favorite(Line::default(), is_favorite).width();
 
-        let available_name_width = usize::from(text_area.width).saturating_sub(marker_width);
+        let available_name_width = usize::from(inner.width).saturating_sub(marker_width);
 
         let name = Line::from(truncate_to_width(&self.name, available_name_width));
 
         let name =
             mark_as_favorite(name, is_favorite).patch_style(style.add_modifier(Modifier::BOLD));
 
-        Paragraph::new(name).render(text_area, buf);
+        Paragraph::new(name).render(inner, buf);
     }
 
     async fn on_key_event(&self, key: KeyCode, context: GridEventContext<'_>) -> AppResult<Output> {
@@ -551,8 +507,8 @@ impl GridItem for Artist {
 
 impl GridItem for PlaylistSimple {
     type Id = u32;
-    const CARD_WIDTH: u16 = ALBUM_COVER_WIDTH + 2;
-    const CARD_HEIGHT: u16 = ALBUM_COVER_HEIGHT + 4;
+    const CARD_WIDTH: u16 = 40;
+    const CARD_HEIGHT: u16 = 4;
 
     fn render_card(
         &self,
@@ -560,7 +516,6 @@ impl GridItem for PlaylistSimple {
         buf: &mut Buffer,
         style: Style,
         favorites: &HashSet<Self::Id>,
-        image_cache: &mut ImageManager,
     ) {
         Block::default()
             .borders(Borders::ALL)
@@ -575,27 +530,6 @@ impl GridItem for PlaylistSimple {
             area.height.saturating_sub(2),
         );
 
-        let Some(image_area) = album_cover_area(inner) else {
-            return;
-        };
-
-        if let Some(image_key) = &self.image {
-            if let Some(image) = image_cache.get_mut(image_key) {
-                StatefulImage::default().render(image_area, buf, &mut image.protocol);
-            } else {
-                Paragraph::new("Loading...").render(image_area, buf);
-            }
-        } else {
-            Paragraph::new("No image").render(image_area, buf);
-        }
-
-        let text_area = Rect::new(
-            inner.x,
-            image_area.bottom(),
-            inner.width,
-            inner.bottom().saturating_sub(image_area.bottom()),
-        );
-
         let is_favorite = favorites.contains(&self.id);
 
         // Calculate marker width before truncating the title.
@@ -605,7 +539,7 @@ impl GridItem for PlaylistSimple {
         );
 
         let marker_width = markers.width();
-        let title_width = usize::from(text_area.width).saturating_sub(marker_width);
+        let title_width = usize::from(inner.width).saturating_sub(marker_width);
 
         let title = Line::from(truncate_to_width(&self.title, title_width));
 
@@ -620,10 +554,10 @@ impl GridItem for PlaylistSimple {
 
         Paragraph::new(Text::from(vec![
             title,
-            Line::from(truncate_to_width(&details, usize::from(text_area.width)))
+            Line::from(truncate_to_width(&details, usize::from(inner.width)))
                 .style(Style::default().italic()),
         ]))
-        .render(text_area, buf);
+        .render(inner, buf);
     }
 
     async fn on_key_event(&self, key: KeyCode, context: GridEventContext<'_>) -> AppResult<Output> {
