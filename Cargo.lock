@@ -6046,6 +6046,7 @@ dependencies = [
  "connect-module",
  "controls-module",
  "crossterm",
+ "dirs",
  "disconnect-module",
  "futures",
  "keepawake",
