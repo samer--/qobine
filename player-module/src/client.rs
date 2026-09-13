@@ -116,6 +116,8 @@ impl StreamClient {
             .time_to_live(std::time::Duration::from_hours(24))
             .build();
 
+        tracing::info!("New client with file based streaming: {file_based_streaming}");
+
         let credentials = Mutex::new(credentials);
         let max_audio_quality = RwLock::new(max_audio_quality);
         let file_based_streaming = RwLock::new(file_based_streaming);

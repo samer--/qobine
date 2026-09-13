@@ -78,6 +78,7 @@ impl Downloader {
         track: &Track,
     ) -> AppResult<DownloadResult> {
         let track_url = self.client.get_file_based_streaming_info(track.id).await?;
+        tracing::info!("File based streaming track URL: {}", track_url.url);
 
         let cache_path = cache_path(
             track,
