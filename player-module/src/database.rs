@@ -7,6 +7,7 @@ use sqlx::types::Json;
 use sqlx::{Pool, Sqlite, SqlitePool, sqlite::SqliteConnectOptions};
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
+use std::time::Duration;
 
 pub struct Database {
     pool: Pool<Sqlite>,
@@ -143,6 +144,19 @@ impl Database {
         WHERE rowid = 1
         "#,
             enable,
+        )
+        .execute(&self.pool)
+        .await?;
+
+        Ok(())
+    }
+
+    pub async fn set_playback_position(&self, position: Duration) -> AppResult<()> {
+        let position = position.as_secs_f64();
+
+        sqlx::query!(
+            "UPDATE configuration SET playback_position_seconds = ?1 WHERE rowid = 1",
+            position
         )
         .execute(&self.pool)
         .await?;
@@ -295,7 +309,8 @@ impl Database {
                  disconnect_password,
                  device_name,
                  enable_disconnect,
-                 auto_play
+                 auto_play,
+                 playback_position_seconds
              from configuration where rowid = 1"#
         )
         .fetch_one(&self.pool)
@@ -322,6 +337,9 @@ impl Database {
         let volume = configuration.volume.and_then(|x| x.to_f32()).unwrap_or(1.0);
         let use_file_based_streaming = configuration.use_file_based_streaming.unwrap_or(false);
         let auto_play = configuration.auto_play.unwrap_or(false);
+        let playback_position = configuration
+            .playback_position_seconds
+            .map(Duration::from_secs_f64);
 
         Ok(Configuration {
             max_audio_quality,
@@ -334,6 +352,7 @@ impl Database {
             disconnect_server_url: configuration.disconnect_server_url,
             disconnect_password: configuration.disconnect_password,
             auto_play,
+            playback_position,
         })
     }
 
@@ -509,6 +528,7 @@ struct DatabaseConfiguration {
     disconnect_password: Option<String>,
     device_name: Option<String>,
     auto_play: Option<bool>,
+    playback_position_seconds: Option<f64>,
 }
 
 #[derive(Default, Debug)]
@@ -523,6 +543,7 @@ pub struct Configuration {
     pub disconnect_password: Option<String>,
     pub device_name: Option<String>,
     pub auto_play: bool,
+    pub playback_position: Option<Duration>,
 }
 
 #[derive(Debug, sqlx::FromRow, serde::Deserialize)]

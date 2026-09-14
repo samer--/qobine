@@ -53,6 +53,7 @@ pub struct Player {
     active_rx: Receiver<bool>,
     auto_play: Sender<bool>,
     auto_play_rx: Receiver<bool>,
+    restore_position: Option<Duration>,
 }
 
 impl Player {
@@ -61,6 +62,7 @@ impl Player {
         client: Arc<StreamClient>,
         volume: f32,
         enable_auto_play: bool,
+        restore_position: Option<Duration>,
         broadcast: Arc<NotificationBroadcast>,
         audio_cache_directory: &Path,
         database: Arc<Database>,
@@ -108,6 +110,7 @@ impl Player {
             active_rx,
             auto_play,
             auto_play_rx,
+            restore_position,
         })
     }
 
@@ -205,6 +208,16 @@ impl Player {
     fn pause(&self) {
         self.set_target_status(Status::Paused);
         self.sink.pause();
+        self.persist_position(self.sink.position());
+    }
+
+    fn persist_position(&self, position: Duration) {
+        let database = self.database.clone();
+        tokio::spawn(async move {
+            if let Err(err) = database.set_playback_position(position).await {
+                tracing::warn!("Failed to persist playback position: {err}");
+            }
+        });
     }
 
     fn set_target_status(&self, status: Status) {
@@ -245,6 +258,13 @@ impl Player {
         }
         self.sink.play();
         self.set_target_status(Status::Playing);
+
+        if !next_track
+            && let Some(position) = self.restore_position.take()
+            && position < Duration::from_secs(u64::from(track.duration_seconds))
+        {
+            self.seek(position)?;
+        }
 
         Ok(())
     }
@@ -289,6 +309,7 @@ impl Player {
         match self.sink.seek(duration) {
             Ok(()) => {
                 self.position.send(self.sink.position())?;
+                self.persist_position(self.sink.position());
             }
             Err(e) => {
                 tracing::warn!("Seek to {:?} failed: {e:?}", duration);
@@ -348,6 +369,9 @@ impl Player {
         }
 
         self.position.send(Duration::default())?;
+        self.database
+            .set_playback_position(Duration::default())
+            .await?;
 
         if tracklist.skip_to_track(new_position).is_some() {
             self.new_queue(tracklist, false).await?;
@@ -793,6 +817,9 @@ impl Player {
             self.position.send(Duration::default())?;
         }
         self.next_track_is_queried = false;
+        self.database
+            .set_playback_position(Duration::default())
+            .await?;
         self.broadcast_tracklist(tracklist).await?;
         Ok(())
     }
@@ -847,6 +874,7 @@ impl Player {
 
                 Ok(exit) = exit_receiver.recv() => {
                     if exit {
+                        self.database.set_playback_position(self.sink.position()).await?;
                         break Ok(());
                     }
                 }

@@ -299,6 +299,7 @@ pub async fn create_player(
         client,
         configuration.volume,
         configuration.auto_play,
+        configuration.playback_position,
         broadcast,
         &audio_cache,
         database,
