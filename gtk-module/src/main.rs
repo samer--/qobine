@@ -30,6 +30,7 @@ pub async fn run() -> AppResult<()> {
     let database = Arc::new(Database::new().await?);
 
     let (exit_sender, exit_receiver) = broadcast::channel(5);
+    controls_module::spawn_ctrl_c_handler(&exit_sender);
 
     let credentials = database.get_credentials().await?;
     let configuration = database.get_configuration().await?;

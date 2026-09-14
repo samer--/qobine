@@ -88,6 +88,7 @@ pub async fn run() -> AppResult<()> {
     }
 
     let (exit_sender, exit_receiver) = broadcast::channel(5);
+    controls_module::spawn_ctrl_c_handler(&exit_sender);
 
     let max_audio_quality = default_audio_quality(&database, args.shared.max_audio_quality).await?;
     let client = get_client(

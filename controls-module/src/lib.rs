@@ -24,3 +24,13 @@ pub enum Status {
 
 pub type ExitReceiver = broadcast::Receiver<bool>;
 pub type ExitSender = broadcast::Sender<bool>;
+
+pub fn spawn_ctrl_c_handler(exit_sender: &ExitSender) {
+    let exit_sender = exit_sender.clone();
+
+    tokio::spawn(async move {
+        if tokio::signal::ctrl_c().await.is_ok() {
+            let _ = exit_sender.send(true);
+        }
+    });
+}
