@@ -12,7 +12,7 @@ use prost::{
 use qconnect_protocol::{
     decode_inbound_json, decode_queue_server_events, decode_renderer_server_commands,
     encode_outbound_payload_bytes, InboundEnvelope, OutboundEnvelope, QueueEventType,
-    QueueServerEvent, RendererServerCommand,
+    QueueServerEvent, RendererCommandType, RendererServerCommand,
 };
 use serde::{Deserialize, Serialize};
 use tokio::{
@@ -21,8 +21,9 @@ use tokio::{
 };
 use tokio_tungstenite::{
     connect_async_with_config,
-    tungstenite::{protocol::WebSocketConfig, Message as WsMessage},
+    tungstenite::{protocol::WebSocketConfig, Bytes, Message as WsMessage},
 };
+use zeroize::{Zeroize, Zeroizing};
 
 use crate::{WsTransportConfig, WsTransportError};
 
@@ -31,6 +32,7 @@ const MSG_TYPE_SUBSCRIBE: u8 = 2;
 const MSG_TYPE_PAYLOAD: u8 = 6;
 const MSG_TYPE_ERROR: u8 = 9;
 const MSG_TYPE_DISCONNECT: u8 = 10;
+const SHUTDOWN_CLOSE_TIMEOUT: Duration = Duration::from_millis(500);
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum TransportEvent {
@@ -38,11 +40,10 @@ pub enum TransportEvent {
     Disconnected,
     Authenticated,
     Subscribed,
-    /// Emitted the first time we observe a `MESSAGE_TYPE_SRVR_CTRL_SESSION_STATE`
-    /// frame on the active WS connection. This is the only proof the
-    /// session-level handshake actually went through (Qobuz cloud accepts the
-    /// WS upgrade well before the JOIN_SESSION negotiation, so `Connected` is
-    /// not a reliable signal — see issue #358).
+    /// Emitted on the first session-level acceptance proof for the active WS:
+    /// controller sessions receive `SRVR_CTRL_SESSION_STATE`; delegated
+    /// renderer handoffs receive targeted `SRVR_RNDR_SET_ACTIVE {active:true}`.
+    /// A WS upgrade alone is never sufficient proof.
     SessionEstablished,
     /// Emitted when the reconnect loop has exhausted
     /// `reconnect_max_attempts` consecutive attempts without ever reaching
@@ -78,14 +79,10 @@ pub enum TransportEvent {
     /// Decoded `MSG_TYPE_ERROR` (cloud_type=9) frame from Qobuz cloud, per the
     /// `qws.proto` `ErrorMessage` definition. Emitted whenever the qws frontend
     /// rejects a session (e.g. zombie session, conflicting device, expired
-    /// JWT). Carries the cloud-side `code` and human-readable `descr` so
-    /// downstream consumers can reason about *why* the cloud is rejecting us
-    /// instead of only seeing a payload byte count (issue #358).
-    CloudError {
-        msg_id: u32,
-        code: u32,
-        descr: String,
-    },
+    /// JWT). Only numeric protocol metadata crosses this boundary: `descr` is
+    /// server-controlled and may reflect credentials, endpoints, account data,
+    /// or session identifiers, so it is zeroized at decode time.
+    CloudError { msg_id: u32, code: u32 },
     InboundQueueServerEvent(QueueServerEvent),
     InboundRendererServerCommand(RendererServerCommand),
     InboundReceived(InboundEnvelope),
@@ -102,7 +99,6 @@ pub trait WsTransport: Send + Sync {
 #[derive(Debug, Default)]
 struct InMemoryState {
     connected: bool,
-    last_config: Option<WsTransportConfig>,
     sent_messages: Vec<OutboundEnvelope>,
 }
 
@@ -152,8 +148,12 @@ impl WsTransport for InMemoryWsTransport {
         }
 
         state.connected = true;
-        state.last_config = Some(config);
         drop(state);
+
+        // The in-memory transport never uses credentials. Dropping the owned
+        // config here invokes its zeroizing cleanup instead of retaining a
+        // needless copy for the lifetime of the transport.
+        drop(config);
 
         self.events_tx
             .send(TransportEvent::Connected)
@@ -203,13 +203,26 @@ impl WsTransport for InMemoryWsTransport {
 struct NativeState {
     connected: bool,
     running: bool,
-    last_config: Option<WsTransportConfig>,
 }
 
 struct NativeRuntime {
     outbound_tx: mpsc::Sender<OutboundEnvelope>,
     shutdown_tx: watch::Sender<bool>,
-    handle: JoinHandle<()>,
+    handle: Option<JoinHandle<()>>,
+}
+
+impl Drop for NativeRuntime {
+    fn drop(&mut self) {
+        let Some(handle) = self.handle.take() else {
+            return;
+        };
+
+        // A dropped JoinHandle normally detaches its task. Explicitly request
+        // shutdown and abort as a fallback so the task-owned config (and its
+        // delegated JWT) cannot remain retained after the transport is gone.
+        let _ = self.shutdown_tx.send(true);
+        handle.abort();
+    }
 }
 
 #[derive(Clone)]
@@ -266,7 +279,6 @@ impl WsTransport for NativeWsTransport {
         {
             let mut state = self.state.lock().await;
             state.running = true;
-            state.last_config = Some(config.clone());
         }
 
         let (outbound_tx, outbound_rx) = mpsc::channel::<OutboundEnvelope>(512);
@@ -281,13 +293,13 @@ impl WsTransport for NativeWsTransport {
         *runtime_guard = Some(NativeRuntime {
             outbound_tx,
             shutdown_tx,
-            handle,
+            handle: Some(handle),
         });
         Ok(())
     }
 
     async fn disconnect(&self) -> Result<(), WsTransportError> {
-        let runtime = self
+        let mut runtime = self
             .runtime
             .lock()
             .await
@@ -298,6 +310,10 @@ impl WsTransport for NativeWsTransport {
 
         runtime
             .handle
+            .take()
+            .ok_or_else(|| {
+                WsTransportError::Internal("native transport task handle missing".to_string())
+            })?
             .await
             .map_err(|err| WsTransportError::Join(err.to_string()))?;
 
@@ -358,7 +374,8 @@ async fn run_native_transport_loop(
 
         let (mut ws, _) = match connect_result {
             Ok(Ok((ws, response))) => (ws, response),
-            Ok(Err(err)) => {
+            Ok(Err(_)) => {
+                let reason = "connect_error".to_string();
                 match handle_reconnect_delay(
                     &events_tx,
                     &mut shutdown_rx,
@@ -366,7 +383,7 @@ async fn run_native_transport_loop(
                     &mut backoff,
                     max_backoff,
                     max_attempts,
-                    format!("connect_error:{err}"),
+                    reason,
                 )
                 .await
                 {
@@ -434,12 +451,15 @@ async fn run_native_transport_loop(
         emit(&events_tx, TransportEvent::Connected);
 
         if let Some(jwt_qws) = config.jwt_qws.as_ref() {
-            if let Err(err) = send_authenticate(&mut ws, &mut msg_id, jwt_qws).await {
+            if send_authenticate(&mut ws, &mut msg_id, jwt_qws)
+                .await
+                .is_err()
+            {
                 emit(
                     &events_tx,
                     TransportEvent::TransportError {
                         stage: "authenticate".to_string(),
-                        message: err.to_string(),
+                        message: "authenticate_failed".to_string(),
                     },
                 );
                 let _ = ws.close(None).await;
@@ -527,19 +547,20 @@ async fn run_native_transport_loop(
         }
 
         if config.auto_subscribe {
-            if let Err(err) = send_subscribe(
+            if send_subscribe(
                 &mut ws,
                 &mut msg_id,
                 config.qcloud_proto,
                 &config.subscribe_channels,
             )
             .await
+            .is_err()
             {
                 emit(
                     &events_tx,
                     TransportEvent::TransportError {
                         stage: "subscribe".to_string(),
-                        message: err.to_string(),
+                        message: "subscribe_failed".to_string(),
                     },
                 );
                 let _ = ws.close(None).await;
@@ -585,20 +606,15 @@ async fn run_native_transport_loop(
         ));
         keepalive.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
-        // Per-connection latch. Only the first SESSION_STATE on this WS resets
-        // the reconnect counters — subsequent ones are no-ops, so we don't
-        // keep paying the lock cost.
+        // Per-connection latch. Only the first controller SESSION_STATE or
+        // delegated renderer SET_ACTIVE=true resets the reconnect counters.
         let mut session_established = false;
 
         // Per-connection keepalive half-open tracking (gap #6). The deadline is
         // ~2.5× the ping interval: a healthy peer answers within one interval,
         // so two unanswered pings plus 2.5× silence is a confident half-open
         // signal without being trigger-happy.
-        let keepalive_deadline_ms = config
-            .keepalive_interval_ms
-            .max(1_000)
-            .saturating_mul(5)
-            / 2;
+        let keepalive_deadline_ms = config.keepalive_interval_ms.max(1_000).saturating_mul(5) / 2;
         let mut last_pong_at_ms = now_ms();
         let mut outstanding_pings: u32 = 0;
 
@@ -606,20 +622,24 @@ async fn run_native_transport_loop(
             tokio::select! {
                 _ = shutdown_rx.changed() => {
                     if *shutdown_rx.borrow() {
-                        let _ = ws.close(None).await;
+                        let _ = tokio::time::timeout(
+                            SHUTDOWN_CLOSE_TIMEOUT,
+                            ws.close(None),
+                        )
+                        .await;
                         break "shutdown".to_string();
                     }
                 }
                 maybe_envelope = outbound_rx.recv() => {
                     match maybe_envelope {
                         Some(envelope) => {
-                            if let Err(err) = send_outbound_payload(
+                            if send_outbound_payload(
                                 &mut ws,
                                 &mut msg_id,
                                 config.qcloud_proto,
                                 &envelope,
-                            ).await {
-                                break format!("send_error:{err}");
+                            ).await.is_err() {
+                                break "send_error".to_string();
                             }
                             emit(
                                 &events_tx,
@@ -646,8 +666,8 @@ async fn run_native_transport_loop(
                     ) {
                         break "keepalive_timeout".to_string();
                     }
-                    if let Err(err) = ws.send(WsMessage::Ping(Vec::new().into())).await {
-                        break format!("keepalive_ping_error:{err}");
+                    if ws.send(WsMessage::Ping(Vec::new().into())).await.is_err() {
+                        break "keepalive_ping_error".to_string();
                     }
                     outstanding_pings = outstanding_pings.saturating_add(1);
                     emit(&events_tx, TransportEvent::KeepalivePingSent);
@@ -655,9 +675,14 @@ async fn run_native_transport_loop(
                 incoming = ws.next() => {
                     match incoming {
                         Some(Ok(WsMessage::Binary(data))) => {
-                            match handle_incoming_binary(&events_tx, &data) {
-                                Ok(InboundFrameOutcome { session_state_seen }) => {
-                                    if session_state_seen && !session_established {
+                            match handle_incoming_binary(
+                                &events_tx,
+                                &data,
+                                config.jwt_qws.as_deref(),
+                                Some(&config.endpoint_url),
+                            ) {
+                                Ok(InboundFrameOutcome { session_established_seen }) => {
+                                    if session_established_seen && !session_established {
                                         session_established = true;
                                         reconnect_attempt = 0;
                                         backoff = base_backoff;
@@ -669,7 +694,11 @@ async fn run_native_transport_loop(
                                         &events_tx,
                                         TransportEvent::TransportError {
                                             stage: "decode_inbound_binary".to_string(),
-                                            message: err.to_string(),
+                                            message: redact_sensitive(
+                                                err.to_string(),
+                                                config.jwt_qws.as_deref(),
+                                                Some(&config.endpoint_url),
+                                            ),
                                         },
                                     );
                                 }
@@ -687,8 +716,8 @@ async fn run_native_transport_loop(
                             break "remote_close".to_string();
                         }
                         Some(Ok(_)) => {}
-                        Some(Err(err)) => {
-                            break format!("ws_read_error:{err}");
+                        Some(Err(_)) => {
+                            break "ws_read_error".to_string();
                         }
                         None => {
                             break "ws_stream_end".to_string();
@@ -708,6 +737,11 @@ async fn run_native_transport_loop(
             break;
         }
 
+        let disconnect_reason = redact_sensitive(
+            disconnect_reason,
+            config.jwt_qws.as_deref(),
+            Some(&config.endpoint_url),
+        );
         match handle_reconnect_delay(
             &events_tx,
             &mut shutdown_rx,
@@ -808,8 +842,8 @@ async fn handle_reconnect_delay(
 /// and returns `true` so the caller can `continue` the loop.
 ///
 /// NOTE: this resets the counters ONLY after Exhausted + a deliberate idle
-/// wait — never on connect. The issue #358 latch (reset only on the first
-/// SESSION_STATE) is therefore untouched.
+/// wait — never on connect. The session-acceptance latch is therefore
+/// untouched.
 async fn idle_retry_after_exhausted(
     shutdown_rx: &mut watch::Receiver<bool>,
     reconnect_attempt: &mut u32,
@@ -833,18 +867,28 @@ async fn idle_retry_after_exhausted(
     true
 }
 
-/// Side-channel result from `handle_incoming_binary`: we need to know whether
-/// any decoded frame contained a `MESSAGE_TYPE_SRVR_CTRL_SESSION_STATE` event,
-/// because that is the signal the reconnect loop uses to reset its backoff
-/// counters (see issue #358).
+/// Side-channel result from `handle_incoming_binary`: the transport owns the
+/// per-connection reconnect latch, so acceptance is recognized before decoded
+/// events can be delayed in downstream broadcast consumers.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 struct InboundFrameOutcome {
-    session_state_seen: bool,
+    session_established_seen: bool,
+}
+
+fn is_session_established_command(command: &RendererServerCommand) -> bool {
+    command.command_type == RendererCommandType::SrvrRndrSetActive
+        && command
+            .payload
+            .get("active")
+            .and_then(serde_json::Value::as_bool)
+            == Some(true)
 }
 
 fn handle_incoming_binary(
     events_tx: &broadcast::Sender<TransportEvent>,
     data: &[u8],
+    jwt_qws: Option<&str>,
+    sensitive_endpoint: Option<&str>,
 ) -> Result<InboundFrameOutcome, WsTransportError> {
     let (cloud_message_type, payload) = decode_qcloud_frame(data)?;
     let mut outcome = InboundFrameOutcome::default();
@@ -877,35 +921,39 @@ fn handle_incoming_binary(
             //   field 2 (int32): messages_id
             //   field 3 (repeated): QConnectMessage entries
             // Pass directly to decoders — no inner envelope unwrapping needed.
-            tracing::info!(
+            tracing::debug!(
                 "[QConnect/Decode] Decoding QConnectBatch: {} bytes",
                 inner_payload.len()
             );
 
             match decode_queue_server_events(&inner_payload) {
                 Ok(events) => {
-                    tracing::info!("[QConnect/Decode] Queue events decoded: {}", events.len());
+                    tracing::debug!("[QConnect/Decode] Queue events decoded: {}", events.len());
                     for event in events {
                         if event.event_type == QueueEventType::SrvrCtrlSessionState {
-                            outcome.session_state_seen = true;
+                            outcome.session_established_seen = true;
                         }
                         emit(events_tx, TransportEvent::InboundQueueServerEvent(event));
                     }
                 }
                 Err(err) => {
-                    tracing::warn!("[QConnect/Decode] Queue events decode error: {}", err);
+                    let message = redact_sensitive(err.to_string(), jwt_qws, sensitive_endpoint);
+                    tracing::warn!("[QConnect/Decode] Queue events decode error: {}", message);
                 }
             }
 
             match decode_renderer_server_commands(&inner_payload) {
                 Ok(commands) => {
                     if !commands.is_empty() {
-                        tracing::info!(
+                        tracing::debug!(
                             "[QConnect/Decode] Renderer commands decoded: {}",
                             commands.len()
                         );
                     }
                     for command in commands {
+                        if is_session_established_command(&command) {
+                            outcome.session_established_seen = true;
+                        }
                         emit(
                             events_tx,
                             TransportEvent::InboundRendererServerCommand(command),
@@ -913,7 +961,11 @@ fn handle_incoming_binary(
                     }
                 }
                 Err(err) => {
-                    tracing::debug!("[QConnect/Decode] Renderer commands decode error: {}", err);
+                    let message = redact_sensitive(err.to_string(), jwt_qws, sensitive_endpoint);
+                    tracing::debug!(
+                        "[QConnect/Decode] Renderer commands decode error: {}",
+                        message
+                    );
                 }
             }
 
@@ -935,21 +987,13 @@ fn handle_incoming_binary(
                 Ok(error) => {
                     let msg_id = error.msg_id.unwrap_or(0);
                     let code = error.code.unwrap_or(0);
-                    let descr = error.descr.unwrap_or_default();
+                    let mut descr = error.descr.unwrap_or_default();
+                    descr.zeroize();
                     tracing::warn!(
-                        "[QConnect/Transport] Cloud error frame: msg_id={} code={} descr={:?}",
-                        msg_id,
-                        code,
-                        descr
+                        "[QConnect/Transport] Cloud error frame: msg_id={} code={}",
+                        msg_id, code
                     );
-                    emit(
-                        events_tx,
-                        TransportEvent::CloudError {
-                            msg_id,
-                            code,
-                            descr,
-                        },
-                    );
+                    emit(events_tx, TransportEvent::CloudError { msg_id, code });
                 }
                 Err(err) => {
                     tracing::warn!(
@@ -990,13 +1034,24 @@ async fn send_authenticate<S>(
 where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
 {
-    let auth = Authenticate {
+    let mut auth = Authenticate {
         msg_id: Some(next_msg_id(msg_id)),
         msg_date: Some(now_ms()),
         jwt: Some(jwt_qws.to_string()),
     };
-    let frame = encode_qcloud_frame(MSG_TYPE_AUTHENTICATE, &auth.encode_to_vec());
-    ws.send(WsMessage::Binary(frame.into()))
+
+    // Encode directly into the qcloud frame so the protobuf payload is not a
+    // second temporary buffer containing the JWT. The unavoidable protobuf
+    // String copy is scrubbed before the first await point.
+    let frame_result = encode_qcloud_message(MSG_TYPE_AUTHENTICATE, &auth);
+    if let Some(jwt_qws) = auth.jwt.as_mut() {
+        jwt_qws.zeroize();
+    }
+    // Keep the encoded frame in an owner that scrubs its allocation when the
+    // last tungstenite `Bytes` reference is released.
+    let frame = Bytes::from_owner(Zeroizing::new(frame_result?));
+
+    ws.send(WsMessage::Binary(frame))
         .await
         .map_err(|err| WsTransportError::Protocol(format!("send authenticate: {err}")))
 }
@@ -1056,6 +1111,42 @@ fn encode_qcloud_frame(msg_type: u8, payload: &[u8]) -> Vec<u8> {
     encode_varint(payload.len() as u64, &mut frame);
     frame.extend_from_slice(payload);
     frame
+}
+
+fn encode_qcloud_message<M: Message>(
+    msg_type: u8,
+    message: &M,
+) -> Result<Vec<u8>, WsTransportError> {
+    let payload_len = message.encoded_len();
+    let mut frame = Vec::with_capacity(1 + 10 + payload_len);
+    frame.push(msg_type);
+    encode_varint(payload_len as u64, &mut frame);
+    message
+        .encode(&mut frame)
+        .map_err(|err| WsTransportError::Serialization(err.to_string()))?;
+    Ok(frame)
+}
+
+/// Remove delegated credentials and endpoint routing material from any
+/// server-controlled diagnostic before it reaches logs or transport events.
+/// Each replaced allocation is overwritten before the safe value continues.
+fn redact_sensitive(
+    mut message: String,
+    jwt_qws: Option<&str>,
+    sensitive_endpoint: Option<&str>,
+) -> String {
+    for sensitive in [jwt_qws, sensitive_endpoint]
+        .into_iter()
+        .flatten()
+        .filter(|value| !value.is_empty())
+    {
+        if message.contains(sensitive) {
+            let redacted = message.replace(sensitive, "[REDACTED]");
+            message.zeroize();
+            message = redacted;
+        }
+    }
+    message
 }
 
 fn decode_qcloud_frame(data: &[u8]) -> Result<(u8, &[u8]), WsTransportError> {
@@ -1225,7 +1316,7 @@ mod tests {
     }
 
     /// Issue #358: a qws-level `MSG_TYPE_ERROR` frame must surface as a
-    /// `CloudError` event carrying the decoded code + descr, NOT as an opaque
+    /// `CloudError` event carrying the decoded numeric code, NOT as an opaque
     /// `bytes=N` `TransportError`. Without this, the upper layer can't
     /// distinguish a zombie session from any other transport hiccup and the
     /// reconnect loop spins blindly.
@@ -1242,8 +1333,8 @@ mod tests {
         .encode_to_vec();
         let frame = encode_qcloud_frame(MSG_TYPE_ERROR, &error_payload);
 
-        let outcome = handle_incoming_binary(&events_tx, &frame).expect("decode frame");
-        assert!(!outcome.session_state_seen);
+        let outcome = handle_incoming_binary(&events_tx, &frame, None, None).expect("decode frame");
+        assert!(!outcome.session_established_seen);
 
         // First event is always InboundFrameDecoded; skip it and assert the
         // semantic event afterwards is CloudError, not the legacy
@@ -1252,17 +1343,67 @@ mod tests {
         assert!(matches!(first, TransportEvent::InboundFrameDecoded { .. }));
 
         match events_rx.recv().await.expect("second event") {
-            TransportEvent::CloudError {
-                msg_id,
-                code,
-                descr,
-            } => {
+            TransportEvent::CloudError { msg_id, code } => {
                 assert_eq!(msg_id, 42);
                 assert_eq!(code, 403);
-                assert_eq!(descr, "zombie_session");
             }
             other => panic!("expected CloudError, got {other:?}"),
         }
+    }
+
+    #[tokio::test]
+    async fn cloud_error_discards_server_description() {
+        const JWT: &str = "header.payload.secret-signature";
+        let (events_tx, mut events_rx) = broadcast::channel::<TransportEvent>(8);
+
+        let error_payload = QwsErrorMessage {
+            msg_id: Some(7),
+            msg_date: None,
+            code: Some(403),
+            descr: Some(format!("rejected credential {JWT}")),
+        }
+        .encode_to_vec();
+        let frame = encode_qcloud_frame(MSG_TYPE_ERROR, &error_payload);
+
+        handle_incoming_binary(&events_tx, &frame, Some(JWT), None).expect("decode frame");
+        let _ = events_rx.recv().await.expect("frame event");
+
+        let event = events_rx.recv().await.expect("cloud error event");
+        let debug = format!("{event:?}");
+        assert!(!debug.contains(JWT));
+        assert!(matches!(
+            event,
+            TransportEvent::CloudError {
+                msg_id: 7,
+                code: 403
+            }
+        ));
+    }
+
+    #[test]
+    fn delegated_set_active_true_is_session_acceptance_proof() {
+        let active = RendererServerCommand {
+            command_type: RendererCommandType::SrvrRndrSetActive,
+            payload: serde_json::json!({ "active": true }),
+        };
+        let inactive = RendererServerCommand {
+            command_type: RendererCommandType::SrvrRndrSetActive,
+            payload: serde_json::json!({ "active": false }),
+        };
+
+        assert!(is_session_established_command(&active));
+        assert!(!is_session_established_command(&inactive));
+    }
+
+    #[test]
+    fn diagnostics_redact_both_delegated_secrets() {
+        const JWT: &str = "header.payload.secret-signature";
+        const ENDPOINT: &str = "wss://qws.example.test/ws?route=secret";
+        let message = format!("rejected {JWT} at {ENDPOINT}");
+
+        let redacted = redact_sensitive(message, Some(JWT), Some(ENDPOINT));
+
+        assert_eq!(redacted, "rejected [REDACTED] at [REDACTED]");
     }
 
     #[test]

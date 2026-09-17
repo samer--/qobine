@@ -408,17 +408,29 @@ fn resolve_renderer_message_type(message: &QConnectMessage) -> Option<i32> {
     })
 }
 
+/// A renderer occurrence whose `queue_item_id` is negative is the official
+/// "there is no such item" marker: the server sends `-1` for `next_track` when
+/// the cursor it commands sits on the LAST queue row (wire-captured
+/// 2026-09-15). Treating it as a decode error rejected the whole batch, so a
+/// controller tap on the last row reached the renderer as nothing at all, over
+/// and over, while every other row worked.
+fn optional_renderer_occurrence(
+    track: Option<QueueTrackWithContext>,
+) -> Result<Option<Value>, ProtocolError> {
+    let Some(track) = track else {
+        return Ok(None);
+    };
+    if track.queue_item_id.is_some_and(|id| id < 0) {
+        return Ok(None);
+    }
+    queue_track_with_context_to_json(track).map(Some)
+}
+
 fn map_srvr_rndr_set_state(
     payload: RendererSetStateMessage,
 ) -> Result<RendererServerCommand, ProtocolError> {
-    let current_track = payload
-        .current_track
-        .map(queue_track_with_context_to_json)
-        .transpose()?;
-    let next_track = payload
-        .next_track
-        .map(queue_track_with_context_to_json)
-        .transpose()?;
+    let current_track = optional_renderer_occurrence(payload.current_track)?;
+    let next_track = optional_renderer_occurrence(payload.next_track)?;
     let queue_version = queue_version_opt(payload.queue_version)?;
 
     Ok(RendererServerCommand {
@@ -807,11 +819,15 @@ fn map_ctrl_renderer_state_updated(
 ) -> Result<QueueServerEvent, ProtocolError> {
     let player_state = payload.player_state.map(|ps| {
         json!({
-            "playing_state": ps.playing_state,
-            "buffer_state": ps.buffer_state,
-            "current_position": ps.current_position.as_ref().and_then(|pos| pos.value),
-            "duration": ps.duration,
-            "current_queue_item_id": ps.current_queue_item_id
+            "playing_state": ps.playing_state.unwrap_or(0),
+            "buffer_state": ps.buffer_state.unwrap_or(0),
+            "current_position": ps.current_position.as_ref().map(|pos| pos.value.unwrap_or(0)),
+            "duration": ps.duration.unwrap_or(0),
+            // Official proto3 RendererPlayerState defaults an omitted scalar
+            // cursor to 0. Only an absent player_state is absent; -1 is the
+            // explicit no-track sentinel. Treating zero as unknown strands
+            // next/previous on the first item after a peer takeover.
+            "current_queue_item_id": ps.current_queue_item_id.unwrap_or(0)
         })
     });
 
@@ -828,14 +844,21 @@ fn map_ctrl_renderer_state_updated(
 }
 
 fn map_add_renderer(payload: CtrlAddRendererMessage) -> Result<QueueServerEvent, ProtocolError> {
-    let device_info = payload.device_info.map(|di| {
-        json!({
+    let device_info = payload.device_info.map(|di| -> Result<Value, ProtocolError> {
+        Ok(json!({
+            "device_uuid": uuid_bytes_to_string_opt(di.device_uuid, "device_info.device_uuid")?,
             "friendly_name": di.friendly_name,
             "brand": di.brand,
             "model": di.model,
-            "device_type": di.device_type
-        })
-    });
+            "device_type": di.device_type,
+            // Controllers must retain the renderer's explicit restrictions.
+            "capabilities": di.capabilities.map(|capabilities| json!({
+                "min_audio_quality": capabilities.min_audio_quality,
+                "max_audio_quality": capabilities.max_audio_quality,
+                "volume_remote_control": capabilities.volume_remote_control,
+            }))
+        }))
+    }).transpose()?;
 
     Ok(QueueServerEvent {
         event_type: QueueEventType::SrvrCtrlAddRenderer,
@@ -851,14 +874,21 @@ fn map_add_renderer(payload: CtrlAddRendererMessage) -> Result<QueueServerEvent,
 fn map_update_renderer(
     payload: CtrlUpdateRendererMessage,
 ) -> Result<QueueServerEvent, ProtocolError> {
-    let device_info = payload.device_info.map(|di| {
-        json!({
+    let device_info = payload.device_info.map(|di| -> Result<Value, ProtocolError> {
+        Ok(json!({
+            "device_uuid": uuid_bytes_to_string_opt(di.device_uuid, "device_info.device_uuid")?,
             "friendly_name": di.friendly_name,
             "brand": di.brand,
             "model": di.model,
-            "device_type": di.device_type
-        })
-    });
+            "device_type": di.device_type,
+            // Controllers must retain the renderer's explicit restrictions.
+            "capabilities": di.capabilities.map(|capabilities| json!({
+                "min_audio_quality": capabilities.min_audio_quality,
+                "max_audio_quality": capabilities.max_audio_quality,
+                "volume_remote_control": capabilities.volume_remote_control,
+            }))
+        }))
+    }).transpose()?;
 
     Ok(QueueServerEvent {
         event_type: QueueEventType::SrvrCtrlUpdateRenderer,
@@ -906,7 +936,7 @@ fn map_ctrl_volume_changed(
         queue_version: None,
         payload: json!({
             "renderer_id": payload.renderer_id,
-            "volume": payload.volume
+            "volume": payload.volume.unwrap_or(0)
         }),
     })
 }
@@ -933,7 +963,7 @@ fn map_ctrl_volume_muted(
         queue_version: None,
         payload: json!({
             "renderer_id": payload.renderer_id,
-            "value": payload.value
+            "value": payload.value.unwrap_or(false)
         }),
     })
 }
@@ -1033,8 +1063,16 @@ fn queue_version_opt(
     };
 
     // Qobuz may send QueueVersionRef with missing major/minor — default to 0
-    let major = version.major.map(|v| i32_to_u64(v)).transpose()?.unwrap_or(0);
-    let minor = version.minor.map(|v| i32_to_u64(v)).transpose()?.unwrap_or(0);
+    let major = version
+        .major
+        .map(|v| i32_to_u64(v))
+        .transpose()?
+        .unwrap_or(0);
+    let minor = version
+        .minor
+        .map(|v| i32_to_u64(v))
+        .transpose()?
+        .unwrap_or(0);
     Ok(Some(QueueVersion::new(major, minor)))
 }
 
@@ -1094,6 +1132,156 @@ mod tests {
     use super::{
         decode_playback_error, decode_queue_server_events, decode_renderer_server_commands,
     };
+
+    #[test]
+    fn controller_renderer_uuid_survives_add_and_update_frames() {
+        use crate::queue_command_proto::{CtrlAddRendererMessage, CtrlUpdateRendererMessage, DeviceInfoMessage};
+        let uuid = uuid::Uuid::parse_str("13d40c34-df5d-4eb5-a513-e5145364a800").unwrap();
+        for update in [false, true] {
+            for bytes in [None, Some(uuid.as_bytes().to_vec()), Some(vec![1, 2])] {
+                let info = DeviceInfoMessage { device_uuid: bytes.clone(), ..Default::default() };
+                let mut message = QConnectMessage::default();
+                if update {
+                    message.srvr_ctrl_update_renderer = Some(CtrlUpdateRendererMessage { renderer_id: Some(2), device_info: Some(info) });
+                } else {
+                    message.srvr_ctrl_add_renderer = Some(CtrlAddRendererMessage { renderer_id: Some(2), device_info: Some(info) });
+                }
+                let batch = QConnectMessages { messages: vec![message], ..Default::default() };
+                let result = decode_queue_server_events(&batch.encode_to_vec());
+                if bytes.as_ref().is_some_and(|bytes| bytes.len() != 16) {
+                    assert!(result.is_err());
+                } else {
+                    let events = result.unwrap();
+                    assert_eq!(events[0].payload["device_info"]["device_uuid"], serde_json::json!(bytes.map(|_| uuid.to_string())));
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn controller_renderer_capabilities_survive_add_and_update_frames() {
+        use crate::queue_command_proto::{
+            CtrlAddRendererMessage, CtrlUpdateRendererMessage, DeviceCapabilitiesMessage,
+            DeviceInfoMessage,
+        };
+        for volume in [None, Some(0), Some(1), Some(2)] {
+            for update in [false, true] {
+                let info = DeviceInfoMessage {
+                    friendly_name: Some("renderer".into()),
+                    capabilities: Some(DeviceCapabilitiesMessage {
+                        min_audio_quality: Some(1),
+                        max_audio_quality: Some(4),
+                        volume_remote_control: volume,
+                    }),
+                    ..Default::default()
+                };
+                let mut message = QConnectMessage::default();
+                if update {
+                    message.srvr_ctrl_update_renderer = Some(CtrlUpdateRendererMessage {
+                        renderer_id: Some(2),
+                        device_info: Some(info),
+                    });
+                } else {
+                    message.srvr_ctrl_add_renderer = Some(CtrlAddRendererMessage {
+                        renderer_id: Some(2),
+                        device_info: Some(info),
+                    });
+                }
+                let batch = QConnectMessages {
+                    messages: vec![message],
+                    ..Default::default()
+                };
+                let events = decode_queue_server_events(&batch.encode_to_vec()).unwrap();
+                assert_eq!(
+                    events[0].payload["device_info"]["capabilities"],
+                    serde_json::json!({
+                        "min_audio_quality": 1, "max_audio_quality": 4, "volume_remote_control": volume,
+                    }),
+                    "update={update}, volume={volume:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn controller_state_proto3_zero_cursor_and_position_are_not_missing() {
+        // Official proto3 encoder omits scalar zero, including queue item 0.
+        // Type 82, renderer 1, PLAY, present-but-empty position, no cursor tag.
+        let raw = [
+            0x08, 0x52, 0x92, 0x05, 0x08, 0x08, 0x01, 0x1a, 0x04, 0x08, 0x02, 0x1a, 0x00,
+        ];
+        let batch = QConnectMessages {
+            messages: vec![QConnectMessage::decode(raw.as_slice()).unwrap()],
+            ..Default::default()
+        };
+        let events = decode_queue_server_events(&batch.encode_to_vec()).unwrap();
+        let state = &events[0].payload["player_state"];
+        assert_eq!(state["current_queue_item_id"], 0);
+        assert_eq!(state["current_position"], 0);
+        assert_eq!(state["playing_state"], 2);
+    }
+
+    #[test]
+    fn controller_state_absent_player_or_position_stays_absent() {
+        use crate::queue_command_proto::{
+            CtrlRendererPlayerState, CtrlRendererStateUpdatedMessage,
+        };
+        for player_state in [
+            None,
+            Some(CtrlRendererPlayerState {
+                current_queue_item_id: Some(-1),
+                ..Default::default()
+            }),
+        ] {
+            let has_player = player_state.is_some();
+            let batch = QConnectMessages {
+                messages: vec![QConnectMessage {
+                    srvr_ctrl_renderer_state_updated: Some(CtrlRendererStateUpdatedMessage {
+                        renderer_id: Some(1),
+                        player_state,
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            };
+            let events = decode_queue_server_events(&batch.encode_to_vec()).unwrap();
+            let state = &events[0].payload["player_state"];
+            if has_player {
+                assert_eq!(state["current_queue_item_id"], -1);
+                assert!(state["current_position"].is_null());
+            } else {
+                assert!(state.is_null());
+            }
+        }
+    }
+
+    #[test]
+    fn controller_volume_zero_and_unmute_decode_official_scalar_defaults() {
+        use crate::queue_command_proto::{CtrlVolumeChangedMessage, CtrlVolumeMutedMessage};
+        let batch = QConnectMessages {
+            messages: vec![
+                QConnectMessage {
+                    srvr_ctrl_volume_changed: Some(CtrlVolumeChangedMessage {
+                        renderer_id: Some(2),
+                        volume: None,
+                    }),
+                    ..Default::default()
+                },
+                QConnectMessage {
+                    srvr_ctrl_volume_muted: Some(CtrlVolumeMutedMessage {
+                        renderer_id: Some(2),
+                        value: None,
+                    }),
+                    ..Default::default()
+                },
+            ],
+            ..Default::default()
+        };
+        let events = decode_queue_server_events(&batch.encode_to_vec()).unwrap();
+        assert_eq!(events[0].payload["volume"], 0);
+        assert_eq!(events[1].payload["value"], false);
+    }
 
     #[test]
     fn decodes_playback_error_track_not_streamable() {
@@ -1170,6 +1358,51 @@ mod tests {
             events[0].message_type(),
             "MESSAGE_TYPE_SRVR_CTRL_QUEUE_TRACKS_ADDED"
         );
+    }
+
+    /// Wire-captured 2026-09-15: commanding the LAST queue row carries
+    /// `next_track.queue_item_id = -1`. The batch must still decode — rejecting
+    /// it made the last row of every queue unreachable from a controller.
+    #[test]
+    fn decodes_set_state_whose_next_occurrence_is_the_absent_marker() {
+        let message = QConnectMessage {
+            message_type: Some(QConnectMessageType::MessageTypeSrvrRndrSetState as i32),
+            srvr_rndr_set_state: Some(RendererSetStateMessage {
+                playing_state: Some(2),
+                current_position: Some(0),
+                queue_version: Some(QueueVersionRef {
+                    major: Some(41),
+                    minor: Some(1),
+                }),
+                current_track: Some(QueueTrackWithContext {
+                    queue_item_id: Some(8),
+                    track_id: Some(386_331_733),
+                    context_uuid: None,
+                }),
+                next_track: Some(QueueTrackWithContext {
+                    queue_item_id: Some(-1),
+                    track_id: Some(0),
+                    context_uuid: None,
+                }),
+            }),
+            ..Default::default()
+        };
+        let batch = QConnectMessages {
+            messages_time: Some(1),
+            messages_id: Some(2),
+            messages: vec![message],
+        };
+
+        let commands =
+            decode_renderer_server_commands(&batch.encode_to_vec()).expect("decode renderer batch");
+        assert_eq!(commands.len(), 1);
+        assert_eq!(
+            commands[0].payload["current_track"]["queue_item_id"]
+                .as_u64()
+                .expect("current occurrence"),
+            8
+        );
+        assert!(commands[0].payload["next_track"].is_null());
     }
 
     #[test]

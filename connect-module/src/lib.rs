@@ -249,8 +249,8 @@ impl ConnectState {
             TransportEvent::Disconnected => {
                 tracing::info!("Qobuz Connect disconnected");
             }
-            TransportEvent::CloudError { code, descr, .. } => {
-                tracing::warn!("Qobuz cloud error: code={code} descr={descr:?}");
+            TransportEvent::CloudError { code, .. } => {
+                tracing::warn!("Qobuz cloud error: code={code}");
             }
             TransportEvent::MaxReconnectAttemptsExceeded {
                 attempts,

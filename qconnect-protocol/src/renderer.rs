@@ -2,6 +2,24 @@ use crate::QueueVersion;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
+/// QConnect renderer buffer-state wire values observed in the official
+/// clients. Keep these separate from `playing_state`: pause/play and buffer
+/// readiness are independent axes.
+#[repr(i32)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum RendererBufferState {
+    Buffering = 1,
+    Ok = 2,
+    Error = 3,
+    Underrun = 4,
+}
+
+impl RendererBufferState {
+    pub const fn as_i32(self) -> i32 {
+        self as i32
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum RendererCommandType {
     SrvrRndrSetState,

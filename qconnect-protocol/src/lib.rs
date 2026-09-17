@@ -29,7 +29,8 @@ pub use mapper::{
     encode_queue_command_batch, encode_renderer_report_batch,
 };
 pub use renderer::{
-    RendererCommandType, RendererReport, RendererReportType, RendererServerCommand,
+    RendererBufferState, RendererCommandType, RendererReport, RendererReportType,
+    RendererServerCommand,
 };
 pub use types::QueueVersion;
 pub use wire::{
